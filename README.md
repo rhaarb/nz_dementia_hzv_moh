@@ -61,7 +61,7 @@ Wrote: outputs/minimal_event_count_check/canonical_input_summary.csv
 
 The check writes `outputs/minimal_event_count_check/canonical_input_summary.csv`.
 
-For the full analysis, the expected output is a rendered version of `Code/02_Analysis/09_analysis.rmd`, included as `Code/02_Analysis/09_analysis.html`, together with the tables and figures written to `outputs/Tables`.
+For the full analysis, the expected output is a rendered version of `Code/02_Analysis/09_analysis.rmd`, included as `Code/02_Analysis/09_analysis.html`, together with the tables and figures written to `outputs/Tables`. GitHub may not preview the rendered HTML file because of its size; download the file and open it locally in a web browser to view it.
 
 The planned synthetic-data code check is described in `docs/synthetic_data.md`.
 
