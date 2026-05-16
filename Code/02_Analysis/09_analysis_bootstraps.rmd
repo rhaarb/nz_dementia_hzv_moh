@@ -1,0 +1,2459 @@
+---
+title: "Bootstrap Analyses"
+author: "R. Haarburger, J. Mbinta, S. Wong, A. Wang"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+    df_print: paged
+  pdf_document:
+    toc: true
+    number_sections: true
+---
+
+```{r setup, include = FALSE}
+# Global chunk options
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center"
+)
+
+# Helper: load required packages safely and fail with a clear message
+load_required_packages <- function(pkgs) {
+  missing_pkgs <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
+
+  if (length(missing_pkgs) > 0) {
+    stop(
+      paste0(
+        "The following required packages are not installed: ",
+        paste(missing_pkgs, collapse = ", ")
+      ),
+      call. = FALSE
+    )
+  }
+
+  invisible(lapply(pkgs, library, character.only = TRUE))
+}
+
+required_packages <- c(
+  # Data handling
+  "tidyverse",
+  "data.table",
+
+  # Visualization
+  "ggpubr",
+  "ggfixest",
+  "grid",
+  "gridExtra",
+  "forestploter",
+  "DiagrammeR",
+  "DiagrammeRsvg",
+  "rsvg",
+  "scales",
+
+  # Estimation
+  "rdrobust",
+  "RDHonest",
+  "rdhte",
+  "fixest",
+  "survival",
+  "mgcv",
+  "prodlim",
+  "splines",
+  "survminer",
+  "cmprsk",
+
+  # Tables
+  "table1",
+  "flextable",
+  "officer"
+)
+
+load_required_packages(required_packages)
+```
+
+# Loading bootstrap input
+
+```{r, include = FALSE}
+# Paths
+project_dir <- Sys.getenv("NZ_DATA_DIR", unset = "E:/zoster/Data")
+code_dir <- Sys.getenv("NZ_CODE_DIR", unset = "E:/zoster/Code")
+processed_df_dir <- file.path(project_dir, "Processed_df")
+table_dir <- Sys.getenv("NZ_OUTPUT_DIR", unset = "E:/zoster/Manuscript/Tables")
+
+setwd(project_dir)
+source(file.path(code_dir, "FUNCTIONS.R"))
+dir.create(processed_df_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(table_dir, recursive = TRUE, showWarnings = FALSE)
+
+bootstrap_input_path <- file.path(processed_df_dir, "bootstrap_input_data_main_p.RDS")
+if (!file.exists(bootstrap_input_path)) {
+  stop("Bootstrap input file does not exist: ", bootstrap_input_path, call. = FALSE)
+}
+data_main_p <- readRDS(bootstrap_input_path)
+```
+
+## Bootstrap analyses
+
+```{r, warning=FALSE, message = TRUE}
+# ==========================================================
+# Heterogeneity bootstrap helper functions.
+# ==========================================================
+
+cutoff <- 0
+
+# ---------- weighted quantile ----------
+wtd_quantile <- function(x, w, probs) {
+  if (!length(w) || sum(w, na.rm = TRUE) <= 0) return(rep(NA_real_, length(probs)))
+  o <- order(x); x <- x[o]; w <- w[o]
+  cw <- cumsum(w) / sum(w)
+  sapply(probs, function(p) x[which.max(cw >= p)])
+}
+
+# ---------- fast base preparation ----------
+# Provide: id, x, side, hz, y, g (stratum)
+prepare_base_gender <- function(dat, id_var, strata_var, cutoff = 0) {
+  tibble(
+    id   = dat[[id_var]],
+    x    = dat$running_var_days,
+    side = ifelse(dat$running_var_days < cutoff, "L", "R"),
+    hz   = dat$hz_vacc,
+    y    = dat$dementia,
+    g    = dat[[strata_var]]
+  )
+}
+
+# ---------- m-out-of-n resample by side using row indices ----------
+resample_idx_by_side <- function(base, rho = 0.95) {
+  iL <- which(base$side == "L")
+  iR <- which(base$side == "R")
+  mL <- max(1L, floor(rho * length(iL)))
+  mR <- max(1L, floor(rho * length(iR)))
+  c(sample(iL, mL, replace = TRUE), sample(iR, mR, replace = TRUE))
+}
+
+# ---------- outcome-blind thinning within one stratum level ----------
+# Goal: for each side, expected retained events ≈ E_star
+# Robust handling: if prevalence is 0/NaN -> q=1 (no thinning needed)
+thin_idx_stratum <- function(idx, base, level, E_star = 160) {
+  # restrict to stratum
+  ii <- idx[base$g[idx] == level]
+  if (!length(ii)) return(ii)
+
+  side <- base$side[ii]
+  y    <- base$y[ii]
+
+  # side stats
+  NsL <- sum(side == "L"); NsR <- sum(side == "R")
+  pL  <- mean(y[side == "L"], na.rm = TRUE)
+  pR  <- mean(y[side == "R"], na.rm = TRUE)
+  if (is.nan(pL)) pL <- 0
+  if (is.nan(pR)) pR <- 0
+
+  # thinning probabilities
+  qL <- if (pL <= 0) 1 else min(1, E_star / max(1, NsL * pL))
+  qR <- if (pR <= 0) 1 else min(1, E_star / max(1, NsR * pR))
+
+  u <- runif(length(ii))
+  keep <- (side == "L" & u < qL) | (side == "R" & u < qR)
+  out <- ii[keep]
+
+  # guard: if thinning wiped a side, fall back to no thinning for this stratum
+  if (!(any(base$side[out] == "L") && any(base$side[out] == "R"))) ii else out
+}
+
+# ---------- local counts inside |x| <= h_star by side ----------
+local_counts_ok_idx <- function(ii, base, h_star, n_min_per_side) {
+  if (!length(ii)) return(FALSE)
+  win <- ii[abs(base$x[ii]) <= h_star]
+  if (!length(win)) return(FALSE)
+  tab <- table(base$side[win])
+  all(c("L", "R") %in% names(tab)) && min(as.integer(tab)) >= n_min_per_side
+}
+
+# ---------- rdrobust wrappers ----------
+fit_rd_outcome_idx <- function(ii, base, h_star) {
+  d <- base[ii, , drop = FALSE]
+
+  fit <- tryCatch({
+    rdrobust(
+      y = d$y, x = d$x, fuzzy = d$hz,
+      c = 0, p = 1, kernel = "triangular", masspoints = "adjust",
+      h = h_star
+    )
+  }, error = function(e) NULL)
+
+  if (is.null(fit)) {
+    list(tau = NA_real_, se = NA_real_, tau_rel = NA_real_)
+  } else {
+    # relative effect exactly as in subtype code
+    # NOTE: beta_Y_p_l[1] may be 0 or NA in degenerate cases; guard division
+    denom <- suppressWarnings(as.numeric(fit$beta_Y_p_l[1]))
+    tau   <- unname(fit$coef[1])
+    se    <- unname(fit$se[3])
+    tau_rel <- if (is.finite(denom) && denom != 0) unname(tau / denom) else NA_real_
+    list(tau = tau, se = se, tau_rel = tau_rel)
+  }
+}
+
+fit_first_stage_base <- function(idx, base, h_star) {
+  d <- base[idx, , drop = FALSE]
+  fs <- tryCatch({
+    rdrobust(
+      y = d$hz, x = d$x,
+      c = 0, p = 1, kernel = "triangular", masspoints = "adjust",
+      h = h_star
+    )
+  }, error = function(e) NULL)
+
+  if (is.null(fs)) return(list(tau_fs = NA_real_, se_fs = NA_real_))
+  list(tau_fs = unname(fs$coef[1]), se_fs = unname(fs$se[3]))
+}
+
+fit_first_stage_idx <- function(ii, base, h_star) {
+  d <- base[ii, , drop = FALSE]
+  fs <- tryCatch({
+    rdrobust(
+      y = d$hz, x = d$x,
+      c = 0, p = 1, kernel = "triangular", masspoints = "adjust",
+      h = h_star
+    )
+  }, error = function(e) NULL)
+
+  if (is.null(fs)) return(list(tau_fs = NA_real_, se_fs = NA_real_))
+  list(tau_fs = unname(fs$coef[1]), se_fs = unname(fs$se[3]))
+}
+
+# ---------- one iteration: redraw QC + cached thinning ----------
+boot_once_gender <- function(base, strata_levels, ref_level,
+                             E_star = 160, rho = 0.95,
+                             h_star,
+                             n_min_per_side = 1000,
+                             tau_fs_min = 0.10,
+                             max_redraw = 50L,
+                             cutoff = 0) {
+
+  redraws <- 0L
+  qc_flag <- NA_character_
+
+  # store cached thinned indices if QC passes
+  thinned_by_lv <- NULL
+  fs_base <- NULL
+
+  repeat {
+    redraws <- redraws + 1L
+
+    # bail out (rare): proceed without QC, but still return something
+    if (redraws > max_redraw) {
+      qc_flag <- "max_redraw"
+      idx <- resample_idx_by_side(base, rho = rho)
+      thinned_by_lv <- lapply(strata_levels, function(lv) thin_idx_stratum(idx, base, lv, E_star))
+      names(thinned_by_lv) <- strata_levels
+      fs_base <- fit_first_stage_base(idx, base, h_star)
+      break
+    }
+
+    # 1) base resample (outcome-blind)
+    idx <- resample_idx_by_side(base, rho = rho)
+
+    # 2) base first-stage strength check (cheap: 1 rdrobust per redraw)
+    fs_base <- fit_first_stage_base(idx, base, h_star)
+    if (!is.finite(fs_base$tau_fs) || abs(fs_base$tau_fs) < tau_fs_min) {
+      qc_flag <- "weak_first_stage_base"
+      next
+    }
+
+    # 3) per-stratum thinning + local-n checks (no rdrobust here)
+    qc_fail <- FALSE
+    thinned_by_lv <- vector("list", length(strata_levels))
+    names(thinned_by_lv) <- strata_levels
+
+    for (lv in strata_levels) {
+      ii <- thin_idx_stratum(idx, base, lv, E_star = E_star)
+      thinned_by_lv[[lv]] <- ii
+      if (!local_counts_ok_idx(ii, base, h_star, n_min_per_side)) {
+        qc_flag <- paste0("local_n_fail_", lv)
+        qc_fail <- TRUE
+        break
+      }
+    }
+
+    if (!qc_fail) { qc_flag <- NA_character_; break }
+  }
+
+  # fit outcome + (optional) stratum-specific FS for diagnostics
+  fits <- lapply(strata_levels, function(lv) {
+    ii <- thinned_by_lv[[lv]]
+
+    fr <- fit_rd_outcome_idx(ii, base, h_star)
+    fs <- fit_first_stage_idx(ii, base, h_star)
+
+    nL <- sum(base$side[ii] == "L" & abs(base$x[ii]) <= h_star)
+    nR <- sum(base$side[ii] == "R" & abs(base$x[ii]) <= h_star)
+
+    tibble(
+      level = lv,
+      tau = fr$tau,
+      se  = fr$se,
+      tau_rel = fr$tau_rel,
+      tau_fs  = fs$tau_fs,
+      se_fs   = fs$se_fs,
+      nL_win  = nL,
+      nR_win  = nR,
+      redraws = redraws,
+      qc_flag = qc_flag,
+      tau_fs_base = fs_base$tau_fs
+    )
+  }) |> bind_rows()
+
+  # paired contrasts vs reference within same resample
+  tau_ref     <- fits$tau[fits$level == ref_level]
+  se_ref      <- fits$se [fits$level == ref_level]
+  tau_rel_ref <- fits$tau_rel[fits$level == ref_level]
+
+  fits %>%
+    mutate(
+      delta_vs_ref     = tau - tau_ref,
+      se_ref           = se_ref,
+      delta_rel_vs_ref = tau_rel - tau_rel_ref
+    )
+}
+
+# ---------- main runner ----------
+run_boot_gender <- function(dat, id_var, strata_var,
+                            strata_levels, ref_level,
+                            B = 3000,
+                            E_star = 160, rho = 0.90, cutoff = 0,
+                            h_star,
+                            n_min_per_side = 1000,
+                            tau_fs_min = 0.10,
+                            max_redraw = 50L,
+                            seed = 123,
+                            progress_every = 50L) {
+
+  set.seed(seed)
+
+  # precompute base once (big speed win)
+  base <- prepare_base_gender(dat, id_var = id_var, strata_var = strata_var, cutoff = cutoff)
+
+  out <- vector("list", B)
+  for (b in seq_len(B)) {
+    out[[b]] <- boot_once_gender(
+      base = base,
+      strata_levels = strata_levels,
+      ref_level = ref_level,
+      E_star = E_star, rho = rho,
+      h_star = h_star,
+      n_min_per_side = n_min_per_side,
+      tau_fs_min = tau_fs_min,
+      max_redraw = max_redraw,
+      cutoff = cutoff
+    ) %>% mutate(iteration = b)
+
+    if (progress_every > 0L && (b %% progress_every == 0L)) {
+      message(sprintf("%s - iter %d/%d", Sys.time(), b, B))
+    }
+  }
+  bind_rows(out)
+}
+
+# ==========================================================
+# RUN: GENDER
+# ==========================================================
+
+gender_levels <- c("F", "M")
+ref_gender    <- "M"
+
+boot_gender <- run_boot_gender(
+  dat = data_main_p,
+  id_var = "new_enc_nhi",
+  strata_var = "GENDER",
+  strata_levels = gender_levels,
+  ref_level = ref_gender,
+  B = 1500,
+  E_star = 160,
+  rho = 0.90,
+  cutoff = 0,
+  h_star = 1508.783,
+  n_min_per_side = 1000,
+  tau_fs_min = 0.10,
+  max_redraw = 50L,
+  seed = 123,
+  progress_every = 5
+)
+
+# ==========================================================
+# Summaries: primary, sensitivity, and relative-scale contrasts
+# ==========================================================
+
+# Primary: absolute-scale paired contrast (F - M)
+gender_primary <- boot_gender %>%
+  filter(level != ref_gender, is.finite(delta_vs_ref)) %>%
+  group_by(level) %>%
+  summarise(
+    est_delta  = median(delta_vs_ref, na.rm = TRUE),
+    lo_delta   = quantile(delta_vs_ref, 0.025, na.rm = TRUE),
+    hi_delta   = quantile(delta_vs_ref, 0.975, na.rm = TRUE),
+    p_twosided = 2 * pmin(mean(delta_vs_ref >= 0, na.rm = TRUE),
+                          mean(delta_vs_ref <= 0, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+# Secondary: SE-based weighted summaries (absolute scale)
+gender_sensitivity <- boot_gender %>%
+  filter(level != ref_gender, is.finite(delta_vs_ref), is.finite(se), is.finite(se_ref)) %>%
+  mutate(w = 1 / pmax(1e-12, se^2 + se_ref^2)) %>%
+  group_by(level) %>%
+  summarise(
+    est_w = sum(w * delta_vs_ref) / sum(w),
+    lo_w  = wtd_quantile(delta_vs_ref, w, 0.025),
+    hi_w  = wtd_quantile(delta_vs_ref, w, 0.975),
+    p_w   = { wpos <- sum(w[delta_vs_ref >= 0]); wneg <- sum(w[delta_vs_ref <= 0]);
+    2 * min(wpos, wneg) / (wpos + wneg) },
+    .groups = "drop"
+  )
+
+# Relative-scale paired contrast
+gender_primary_rel <- boot_gender %>%
+  filter(level != ref_gender, is.finite(delta_rel_vs_ref)) %>%
+  group_by(level) %>%
+  summarise(
+    est_delta_rel  = median(delta_rel_vs_ref, na.rm = TRUE),
+    lo_delta_rel   = quantile(delta_rel_vs_ref, 0.025, na.rm = TRUE),
+    hi_delta_rel   = quantile(delta_rel_vs_ref, 0.975, na.rm = TRUE),
+    p_twosided_rel = 2 * pmin(mean(delta_rel_vs_ref >= 0, na.rm = TRUE),
+                              mean(delta_rel_vs_ref <= 0, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+print(gender_primary)
+print(gender_sensitivity)
+print(gender_primary_rel)
+
+saveRDS(boot_gender, file.path(processed_df_dir, "boot_gender.RDS"))
+saveRDS(gender_primary, file.path(processed_df_dir, "gender_primary.RDS"))
+saveRDS(gender_sensitivity, file.path(processed_df_dir, "gender_sensitivity.RDS"))
+
+# ==========================================================
+# RUN: RISK
+# ==========================================================
+
+risk_levels <- c("0", "1")
+ref_risk    <- "0"
+
+boot_risk <- run_boot_gender(
+  dat = data_main_p,
+  id_var = "new_enc_nhi",
+  strata_var = "risk_median",
+  strata_levels = risk_levels,
+  ref_level = ref_risk,
+  B = 1500,
+  E_star = 160,
+  rho = 0.90,
+  cutoff = 0,
+  h_star = 1508.783,
+  n_min_per_side = 1000,
+  tau_fs_min = 0.10,
+  max_redraw = 50L,
+  seed = 123,
+  progress_every = 5
+)
+
+# ==========================================================
+# Summaries: primary, sensitivity, and relative-scale contrasts
+# ==========================================================
+
+# Primary: absolute-scale paired contrast (F - M)
+risk_primary <- boot_risk %>%
+  filter(level != ref_risk, is.finite(delta_vs_ref)) %>%
+  group_by(level) %>%
+  summarise(
+    est_delta  = median(delta_vs_ref, na.rm = TRUE),
+    lo_delta   = quantile(delta_vs_ref, 0.025, na.rm = TRUE),
+    hi_delta   = quantile(delta_vs_ref, 0.975, na.rm = TRUE),
+    p_twosided = 2 * pmin(mean(delta_vs_ref >= 0, na.rm = TRUE),
+                          mean(delta_vs_ref <= 0, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+# Secondary: SE-based weighted summaries (absolute scale)
+risk_sensitivity <- boot_risk %>%
+  filter(level != ref_risk, is.finite(delta_vs_ref), is.finite(se), is.finite(se_ref)) %>%
+  mutate(w = 1 / pmax(1e-12, se^2 + se_ref^2)) %>%
+  group_by(level) %>%
+  summarise(
+    est_w = sum(w * delta_vs_ref) / sum(w),
+    lo_w  = wtd_quantile(delta_vs_ref, w, 0.025),
+    hi_w  = wtd_quantile(delta_vs_ref, w, 0.975),
+    p_w   = { wpos <- sum(w[delta_vs_ref >= 0]); wneg <- sum(w[delta_vs_ref <= 0]);
+    2 * min(wpos, wneg) / (wpos + wneg) },
+    .groups = "drop"
+  )
+
+# Relative-scale paired contrast
+risk_primary_rel <- boot_risk %>%
+  filter(level != ref_risk, is.finite(delta_rel_vs_ref)) %>%
+  group_by(level) %>%
+  summarise(
+    est_delta_rel  = median(delta_rel_vs_ref, na.rm = TRUE),
+    lo_delta_rel   = quantile(delta_rel_vs_ref, 0.025, na.rm = TRUE),
+    hi_delta_rel   = quantile(delta_rel_vs_ref, 0.975, na.rm = TRUE),
+    p_twosided_rel = 2 * pmin(mean(delta_rel_vs_ref >= 0, na.rm = TRUE),
+                              mean(delta_rel_vs_ref <= 0, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+print(risk_primary)
+print(risk_sensitivity)
+print(risk_primary_rel)
+
+saveRDS(boot_risk, file.path(processed_df_dir, "boot_risk.RDS"))
+saveRDS(risk_primary, file.path(processed_df_dir, "risk_primary.RDS"))
+saveRDS(risk_sensitivity, file.path(processed_df_dir, "risk_sensitivity.RDS"))
+
+# ==========================================================
+# RUN: DEPRIVATION
+# ==========================================================
+
+dep_levels <- c("0", "1")
+ref_dep    <- "0"
+data_main_p <- data_main_p %>% filter(!is.na(dep_median))
+boot_dep <- run_boot_gender(
+  dat = data_main_p,
+  id_var = "new_enc_nhi",
+  strata_var = "dep_median",
+  strata_levels = dep_levels,
+  ref_level = ref_dep,
+  B = 1500,
+  E_star = 160,
+  rho = 0.90,
+  cutoff = 0,
+  h_star = 1508.783,
+  n_min_per_side = 1000,
+  tau_fs_min = 0.10,
+  max_redraw = 50L,
+  seed = 123,
+  progress_every = 5
+)
+
+# ==========================================================
+# Summaries: primary, sensitivity, and relative-scale contrasts
+# ==========================================================
+
+# Primary: absolute-scale paired contrast (F - M)
+dep_primary <- boot_dep %>%
+  filter(level != ref_dep, is.finite(delta_vs_ref)) %>%
+  group_by(level) %>%
+  summarise(
+    est_delta  = median(delta_vs_ref, na.rm = TRUE),
+    lo_delta   = quantile(delta_vs_ref, 0.025, na.rm = TRUE),
+    hi_delta   = quantile(delta_vs_ref, 0.975, na.rm = TRUE),
+    p_twosided = 2 * pmin(mean(delta_vs_ref >= 0, na.rm = TRUE),
+                          mean(delta_vs_ref <= 0, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+# Secondary: SE-based weighted summaries (absolute scale)
+dep_sensitivity <- boot_dep %>%
+  filter(level != ref_dep, is.finite(delta_vs_ref), is.finite(se), is.finite(se_ref)) %>%
+  mutate(w = 1 / pmax(1e-12, se^2 + se_ref^2)) %>%
+  group_by(level) %>%
+  summarise(
+    est_w = sum(w * delta_vs_ref) / sum(w),
+    lo_w  = wtd_quantile(delta_vs_ref, w, 0.025),
+    hi_w  = wtd_quantile(delta_vs_ref, w, 0.975),
+    p_w   = { wpos <- sum(w[delta_vs_ref >= 0]); wneg <- sum(w[delta_vs_ref <= 0]);
+    2 * min(wpos, wneg) / (wpos + wneg) },
+    .groups = "drop"
+  )
+
+# Relative-scale paired contrast
+dep_primary_rel <- boot_dep %>%
+  filter(level != ref_dep, is.finite(delta_rel_vs_ref)) %>%
+  group_by(level) %>%
+  summarise(
+    est_delta_rel  = median(delta_rel_vs_ref, na.rm = TRUE),
+    lo_delta_rel   = quantile(delta_rel_vs_ref, 0.025, na.rm = TRUE),
+    hi_delta_rel   = quantile(delta_rel_vs_ref, 0.975, na.rm = TRUE),
+    p_twosided_rel = 2 * pmin(mean(delta_rel_vs_ref >= 0, na.rm = TRUE),
+                              mean(delta_rel_vs_ref <= 0, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+print(dep_primary)
+print(dep_sensitivity)
+print(dep_primary_rel)
+
+saveRDS(boot_dep, file.path(processed_df_dir, "boot_dep.RDS"))
+saveRDS(dep_primary, file.path(processed_df_dir, "dep_primary.RDS"))
+saveRDS(dep_sensitivity, file.path(processed_df_dir, "dep_sensitivity.RDS"))
+
+# ==========================================================
+# RUN: Maori Pasifika
+# ==========================================================
+
+mp_levels <- c("0", "1")
+ref_mp    <- "0"
+
+boot_mp <- run_boot_gender(
+  dat = data_main_p,
+  id_var = "new_enc_nhi",
+  strata_var = "maori_pasifika",
+  strata_levels = mp_levels,
+  ref_level = ref_mp,
+  B = 1500,
+  E_star = 160,
+  rho = 0.90,
+  cutoff = 0,
+  h_star = 1508.783,
+  n_min_per_side = 1000,
+  tau_fs_min = 0.10,
+  max_redraw = 50L,
+  seed = 123,
+  progress_every = 5
+)
+
+# ==========================================================
+# Summaries: primary, sensitivity, and relative-scale contrasts
+# ==========================================================
+
+# Primary: absolute-scale paired contrast (F - M)
+mp_primary <- boot_mp %>%
+  filter(level != ref_mp, is.finite(delta_vs_ref)) %>%
+  group_by(level) %>%
+  summarise(
+    est_delta  = median(delta_vs_ref, na.rm = TRUE),
+    lo_delta   = quantile(delta_vs_ref, 0.025, na.rm = TRUE),
+    hi_delta   = quantile(delta_vs_ref, 0.975, na.rm = TRUE),
+    p_twosided = 2 * pmin(mean(delta_vs_ref >= 0, na.rm = TRUE),
+                          mean(delta_vs_ref <= 0, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+# Secondary: SE-based weighted summaries (absolute scale)
+mp_sensitivity <- boot_mp %>%
+  filter(level != ref_mp, is.finite(delta_vs_ref), is.finite(se), is.finite(se_ref)) %>%
+  mutate(w = 1 / pmax(1e-12, se^2 + se_ref^2)) %>%
+  group_by(level) %>%
+  summarise(
+    est_w = sum(w * delta_vs_ref) / sum(w),
+    lo_w  = wtd_quantile(delta_vs_ref, w, 0.025),
+    hi_w  = wtd_quantile(delta_vs_ref, w, 0.975),
+    p_w   = { wpos <- sum(w[delta_vs_ref >= 0]); wneg <- sum(w[delta_vs_ref <= 0]);
+    2 * min(wpos, wneg) / (wpos + wneg) },
+    .groups = "drop"
+  )
+
+# Relative-scale paired contrast
+mp_primary_rel <- boot_mp %>%
+  filter(level != ref_mp, is.finite(delta_rel_vs_ref)) %>%
+  group_by(level) %>%
+  summarise(
+    est_delta_rel  = median(delta_rel_vs_ref, na.rm = TRUE),
+    lo_delta_rel   = quantile(delta_rel_vs_ref, 0.025, na.rm = TRUE),
+    hi_delta_rel   = quantile(delta_rel_vs_ref, 0.975, na.rm = TRUE),
+    p_twosided_rel = 2 * pmin(mean(delta_rel_vs_ref >= 0, na.rm = TRUE),
+                              mean(delta_rel_vs_ref <= 0, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+print(mp_primary)
+print(mp_sensitivity)
+print(mp_primary_rel)
+
+saveRDS(boot_mp, file.path(processed_df_dir, "boot_mp.RDS"))
+saveRDS(mp_primary, file.path(processed_df_dir, "mp_primary.RDS"))
+saveRDS(mp_sensitivity, file.path(processed_df_dir, "mp_sensitivity.RDS"))
+
+# ==========================================================
+# RUN: Zoster at baseline
+# ==========================================================
+
+zoster_levels <- c("0", "1")
+ref_zoster    <- "0"
+data_main_p <- data_main_p %>% filter(!is.na(zoster_at_bl))
+boot_zoster <- run_boot_gender(
+  dat = data_main_p,
+  id_var = "new_enc_nhi",
+  strata_var = "zoster_at_bl",
+  strata_levels = zoster_levels,
+  ref_level = ref_zoster,
+  B = 1500,
+  E_star = 160,
+  rho = 0.90,
+  cutoff = 0,
+  h_star = 1508.783,
+  n_min_per_side = 1000,
+  tau_fs_min = 0.10,
+  max_redraw = 50L,
+  seed = 123,
+  progress_every = 5
+)
+
+# ==========================================================
+# Summaries: primary, sensitivity, and relative-scale contrasts
+# ==========================================================
+
+# Primary: absolute-scale paired contrast (F - M)
+zoster_primary <- boot_zoster %>%
+  filter(level != ref_zoster, is.finite(delta_vs_ref)) %>%
+  group_by(level) %>%
+  summarise(
+    est_delta  = median(delta_vs_ref, na.rm = TRUE),
+    lo_delta   = quantile(delta_vs_ref, 0.025, na.rm = TRUE),
+    hi_delta   = quantile(delta_vs_ref, 0.975, na.rm = TRUE),
+    p_twosided = 2 * pmin(mean(delta_vs_ref >= 0, na.rm = TRUE),
+                          mean(delta_vs_ref <= 0, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+# Secondary: SE-based weighted summaries (absolute scale)
+zoster_sensitivity <- boot_zoster %>%
+  filter(level != ref_zoster, is.finite(delta_vs_ref), is.finite(se), is.finite(se_ref)) %>%
+  mutate(w = 1 / pmax(1e-12, se^2 + se_ref^2)) %>%
+  group_by(level) %>%
+  summarise(
+    est_w = sum(w * delta_vs_ref) / sum(w),
+    lo_w  = wtd_quantile(delta_vs_ref, w, 0.025),
+    hi_w  = wtd_quantile(delta_vs_ref, w, 0.975),
+    p_w   = { wpos <- sum(w[delta_vs_ref >= 0]); wneg <- sum(w[delta_vs_ref <= 0]);
+    2 * min(wpos, wneg) / (wpos + wneg) },
+    .groups = "drop"
+  )
+
+# Relative-scale paired contrast
+zoster_primary_rel <- boot_zoster %>%
+  filter(level != ref_zoster, is.finite(delta_rel_vs_ref)) %>%
+  group_by(level) %>%
+  summarise(
+    est_delta_rel  = median(delta_rel_vs_ref, na.rm = TRUE),
+    lo_delta_rel   = quantile(delta_rel_vs_ref, 0.025, na.rm = TRUE),
+    hi_delta_rel   = quantile(delta_rel_vs_ref, 0.975, na.rm = TRUE),
+    p_twosided_rel = 2 * pmin(mean(delta_rel_vs_ref >= 0, na.rm = TRUE),
+                              mean(delta_rel_vs_ref <= 0, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+print(zoster_primary)
+print(zoster_sensitivity)
+print(zoster_primary_rel)
+
+saveRDS(boot_zoster, file.path(processed_df_dir, "boot_zoster.RDS"))
+saveRDS(zoster_primary, file.path(processed_df_dir, "zoster_primary.RDS"))
+saveRDS(zoster_sensitivity, file.path(processed_df_dir, "zoster_sensitivity.RDS"))
+
+# ==========================================================
+# RUN: Stroke at baseline
+# ==========================================================
+
+stroke_levels <- c("0", "1")
+ref_stroke    <- "0"
+
+boot_stroke <- run_boot_gender(
+  dat = data_main_p,
+  id_var = "new_enc_nhi",
+  strata_var = "stroke_at_bl_factor",
+  strata_levels = stroke_levels,
+  ref_level = ref_stroke,
+  B = 1500,
+  E_star = 160,
+  rho = 0.90,
+  cutoff = 0,
+  h_star = 1508.783,
+  n_min_per_side = 1000,
+  tau_fs_min = 0.10,
+  max_redraw = 50L,
+  seed = 123,
+  progress_every = 5
+)
+
+# ==========================================================
+# Summaries: primary, sensitivity, and relative-scale contrasts
+# ==========================================================
+
+# Primary: absolute-scale paired contrast (F - M)
+stroke_primary <- boot_stroke %>%
+  filter(level != ref_stroke, is.finite(delta_vs_ref)) %>%
+  group_by(level) %>%
+  summarise(
+    est_delta  = median(delta_vs_ref, na.rm = TRUE),
+    lo_delta   = quantile(delta_vs_ref, 0.025, na.rm = TRUE),
+    hi_delta   = quantile(delta_vs_ref, 0.975, na.rm = TRUE),
+    p_twosided = 2 * pmin(mean(delta_vs_ref >= 0, na.rm = TRUE),
+                          mean(delta_vs_ref <= 0, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+# Secondary: SE-based weighted summaries (absolute scale)
+stroke_sensitivity <- boot_stroke %>%
+  filter(level != ref_stroke, is.finite(delta_vs_ref), is.finite(se), is.finite(se_ref)) %>%
+  mutate(w = 1 / pmax(1e-12, se^2 + se_ref^2)) %>%
+  group_by(level) %>%
+  summarise(
+    est_w = sum(w * delta_vs_ref) / sum(w),
+    lo_w  = wtd_quantile(delta_vs_ref, w, 0.025),
+    hi_w  = wtd_quantile(delta_vs_ref, w, 0.975),
+    p_w   = { wpos <- sum(w[delta_vs_ref >= 0]); wneg <- sum(w[delta_vs_ref <= 0]);
+    2 * min(wpos, wneg) / (wpos + wneg) },
+    .groups = "drop"
+  )
+
+# Relative-scale paired contrast
+stroke_primary_rel <- boot_stroke %>%
+  filter(level != ref_stroke, is.finite(delta_rel_vs_ref)) %>%
+  group_by(level) %>%
+  summarise(
+    est_delta_rel  = median(delta_rel_vs_ref, na.rm = TRUE),
+    lo_delta_rel   = quantile(delta_rel_vs_ref, 0.025, na.rm = TRUE),
+    hi_delta_rel   = quantile(delta_rel_vs_ref, 0.975, na.rm = TRUE),
+    p_twosided_rel = 2 * pmin(mean(delta_rel_vs_ref >= 0, na.rm = TRUE),
+                              mean(delta_rel_vs_ref <= 0, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+print(stroke_primary)
+print(stroke_sensitivity)
+print(stroke_primary_rel)
+
+saveRDS(boot_stroke, file.path(processed_df_dir, "boot_stroke.RDS"))
+saveRDS(stroke_primary, file.path(processed_df_dir, "stroke_primary.RDS"))
+saveRDS(stroke_sensitivity, file.path(processed_df_dir, "stroke_sensitivity.RDS"))
+
+# ==========================================================
+# RUN: Hypertension at baseline
+# ==========================================================
+
+hyper_levels <- c("0", "1")
+ref_hyper    <- "0"
+
+boot_hyper <- run_boot_gender(
+  dat = data_main_p,
+  id_var = "new_enc_nhi",
+  strata_var = "hypertension_at_bl_factor",
+  strata_levels = hyper_levels,
+  ref_level = ref_hyper,
+  B = 1500,
+  E_star = 160,
+  rho = 0.90,
+  cutoff = 0,
+  h_star = 1508.783,
+  n_min_per_side = 1000,
+  tau_fs_min = 0.10,
+  max_redraw = 50L,
+  seed = 123,
+  progress_every = 5
+)
+
+# ==========================================================
+# Summaries: primary, sensitivity, and relative-scale contrasts
+# ==========================================================
+
+# Primary: absolute-scale paired contrast (F - M)
+hyper_primary <- boot_hyper %>%
+  filter(level != ref_hyper, is.finite(delta_vs_ref)) %>%
+  group_by(level) %>%
+  summarise(
+    est_delta  = median(delta_vs_ref, na.rm = TRUE),
+    lo_delta   = quantile(delta_vs_ref, 0.025, na.rm = TRUE),
+    hi_delta   = quantile(delta_vs_ref, 0.975, na.rm = TRUE),
+    p_twosided = 2 * pmin(mean(delta_vs_ref >= 0, na.rm = TRUE),
+                          mean(delta_vs_ref <= 0, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+# Secondary: SE-based weighted summaries (absolute scale)
+hyper_sensitivity <- boot_hyper %>%
+  filter(level != ref_hyper, is.finite(delta_vs_ref), is.finite(se), is.finite(se_ref)) %>%
+  mutate(w = 1 / pmax(1e-12, se^2 + se_ref^2)) %>%
+  group_by(level) %>%
+  summarise(
+    est_w = sum(w * delta_vs_ref) / sum(w),
+    lo_w  = wtd_quantile(delta_vs_ref, w, 0.025),
+    hi_w  = wtd_quantile(delta_vs_ref, w, 0.975),
+    p_w   = { wpos <- sum(w[delta_vs_ref >= 0]); wneg <- sum(w[delta_vs_ref <= 0]);
+    2 * min(wpos, wneg) / (wpos + wneg) },
+    .groups = "drop"
+  )
+
+# Relative-scale paired contrast
+hyper_primary_rel <- boot_hyper %>%
+  filter(level != ref_hyper, is.finite(delta_rel_vs_ref)) %>%
+  group_by(level) %>%
+  summarise(
+    est_delta_rel  = median(delta_rel_vs_ref, na.rm = TRUE),
+    lo_delta_rel   = quantile(delta_rel_vs_ref, 0.025, na.rm = TRUE),
+    hi_delta_rel   = quantile(delta_rel_vs_ref, 0.975, na.rm = TRUE),
+    p_twosided_rel = 2 * pmin(mean(delta_rel_vs_ref >= 0, na.rm = TRUE),
+                              mean(delta_rel_vs_ref <= 0, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+print(hyper_primary)
+print(hyper_sensitivity)
+print(hyper_primary_rel)
+
+saveRDS(boot_hyper, file.path(processed_df_dir, "boot_hyper.RDS"))
+saveRDS(hyper_primary, file.path(processed_df_dir, "hyper_primary.RDS"))
+saveRDS(hyper_sensitivity, file.path(processed_df_dir, "hyper_sensitivity.RDS"))
+
+# ==========================================================
+# RUN: Diabetes at baseline
+# ==========================================================
+
+dm_levels <- c("0", "1")
+ref_dm    <- "0"
+
+boot_dm <- run_boot_gender(
+  dat = data_main_p,
+  id_var = "new_enc_nhi",
+  strata_var = "dm_at_bl_factor",
+  strata_levels = dm_levels,
+  ref_level = ref_dm,
+  B = 1500,
+  E_star = 160,
+  rho = 0.90,
+  cutoff = 0,
+  h_star = 1508.783,
+  n_min_per_side = 1000,
+  tau_fs_min = 0.10,
+  max_redraw = 50L,
+  seed = 123,
+  progress_every = 5
+)
+
+# ==========================================================
+# Summaries: primary, sensitivity, and relative-scale contrasts
+# ==========================================================
+
+# Primary: absolute-scale paired contrast (F - M)
+dm_primary <- boot_dm %>%
+  filter(level != ref_dm, is.finite(delta_vs_ref)) %>%
+  group_by(level) %>%
+  summarise(
+    est_delta  = median(delta_vs_ref, na.rm = TRUE),
+    lo_delta   = quantile(delta_vs_ref, 0.025, na.rm = TRUE),
+    hi_delta   = quantile(delta_vs_ref, 0.975, na.rm = TRUE),
+    p_twosided = 2 * pmin(mean(delta_vs_ref >= 0, na.rm = TRUE),
+                          mean(delta_vs_ref <= 0, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+# Secondary: SE-based weighted summaries (absolute scale)
+dm_sensitivity <- boot_dm %>%
+  filter(level != ref_dm, is.finite(delta_vs_ref), is.finite(se), is.finite(se_ref)) %>%
+  mutate(w = 1 / pmax(1e-12, se^2 + se_ref^2)) %>%
+  group_by(level) %>%
+  summarise(
+    est_w = sum(w * delta_vs_ref) / sum(w),
+    lo_w  = wtd_quantile(delta_vs_ref, w, 0.025),
+    hi_w  = wtd_quantile(delta_vs_ref, w, 0.975),
+    p_w   = { wpos <- sum(w[delta_vs_ref >= 0]); wneg <- sum(w[delta_vs_ref <= 0]);
+    2 * min(wpos, wneg) / (wpos + wneg) },
+    .groups = "drop"
+  )
+
+# Relative-scale paired contrast
+dm_primary_rel <- boot_dm %>%
+  filter(level != ref_dm, is.finite(delta_rel_vs_ref)) %>%
+  group_by(level) %>%
+  summarise(
+    est_delta_rel  = median(delta_rel_vs_ref, na.rm = TRUE),
+    lo_delta_rel   = quantile(delta_rel_vs_ref, 0.025, na.rm = TRUE),
+    hi_delta_rel   = quantile(delta_rel_vs_ref, 0.975, na.rm = TRUE),
+    p_twosided_rel = 2 * pmin(mean(delta_rel_vs_ref >= 0, na.rm = TRUE),
+                              mean(delta_rel_vs_ref <= 0, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+print(dm_primary)
+print(dm_sensitivity)
+print(dm_primary_rel)
+
+saveRDS(boot_dm, file.path(processed_df_dir, "boot_dm.RDS"))
+saveRDS(dm_primary, file.path(processed_df_dir, "dm_primary.RDS"))
+saveRDS(dm_sensitivity, file.path(processed_df_dir, "dm_sensitivity.RDS"))
+
+# ==========================================================
+# RUN: ATF at baseline
+# ==========================================================
+
+atf_levels <- c("0", "1")
+ref_atf    <- "0"
+
+boot_atf <- run_boot_gender(
+  dat = data_main_p,
+  id_var = "new_enc_nhi",
+  strata_var = "atf_at_bl_factor",
+  strata_levels = atf_levels,
+  ref_level = ref_atf,
+  B = 1500,
+  E_star = 160,
+  rho = 0.90,
+  cutoff = 0,
+  h_star = 1508.783,
+  n_min_per_side = 1000,
+  tau_fs_min = 0.10,
+  max_redraw = 50L,
+  seed = 123,
+  progress_every = 5
+)
+
+# ==========================================================
+# Summaries: primary, sensitivity, and relative-scale contrasts
+# ==========================================================
+
+# Primary: absolute-scale paired contrast (F - M)
+atf_primary <- boot_atf %>%
+  filter(level != ref_atf, is.finite(delta_vs_ref)) %>%
+  group_by(level) %>%
+  summarise(
+    est_delta  = median(delta_vs_ref, na.rm = TRUE),
+    lo_delta   = quantile(delta_vs_ref, 0.025, na.rm = TRUE),
+    hi_delta   = quantile(delta_vs_ref, 0.975, na.rm = TRUE),
+    p_twosided = 2 * pmin(mean(delta_vs_ref >= 0, na.rm = TRUE),
+                          mean(delta_vs_ref <= 0, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+# Secondary: SE-based weighted summaries (absolute scale)
+atf_sensitivity <- boot_atf %>%
+  filter(level != ref_atf, is.finite(delta_vs_ref), is.finite(se), is.finite(se_ref)) %>%
+  mutate(w = 1 / pmax(1e-12, se^2 + se_ref^2)) %>%
+  group_by(level) %>%
+  summarise(
+    est_w = sum(w * delta_vs_ref) / sum(w),
+    lo_w  = wtd_quantile(delta_vs_ref, w, 0.025),
+    hi_w  = wtd_quantile(delta_vs_ref, w, 0.975),
+    p_w   = { wpos <- sum(w[delta_vs_ref >= 0]); wneg <- sum(w[delta_vs_ref <= 0]);
+    2 * min(wpos, wneg) / (wpos + wneg) },
+    .groups = "drop"
+  )
+
+# Relative-scale paired contrast
+atf_primary_rel <- boot_atf %>%
+  filter(level != ref_atf, is.finite(delta_rel_vs_ref)) %>%
+  group_by(level) %>%
+  summarise(
+    est_delta_rel  = median(delta_rel_vs_ref, na.rm = TRUE),
+    lo_delta_rel   = quantile(delta_rel_vs_ref, 0.025, na.rm = TRUE),
+    hi_delta_rel   = quantile(delta_rel_vs_ref, 0.975, na.rm = TRUE),
+    p_twosided_rel = 2 * pmin(mean(delta_rel_vs_ref >= 0, na.rm = TRUE),
+                              mean(delta_rel_vs_ref <= 0, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+print(atf_primary)
+print(atf_sensitivity)
+print(atf_primary_rel)
+
+saveRDS(boot_atf, file.path(processed_df_dir, "boot_atf.RDS"))
+saveRDS(atf_primary, file.path(processed_df_dir, "atf_primary.RDS"))
+saveRDS(atf_sensitivity, file.path(processed_df_dir, "atf_sensitivity.RDS"))
+
+```
+
+```{r, warning = FALSE, message = TRUE}
+# ===============================
+# Heterogeneity bootstrap by dementia subtype
+# ===============================
+
+# --- SETTINGS ---
+n_iter   <- 3000
+cutoff   <- 0
+E_star   <- 160
+rho      <- 0.92
+h_star   <- 1508.783
+n_min_per_side <- 800
+tau_fs_min     <- 0.08
+max_redraw     <- 500
+
+# optional: save partial progress every N iterations
+save_every <- 100
+out_dir <- processed_df_dir
+
+# --- SUBTYPES ---
+dementia_outcomes <- c(
+  "alzheimers",
+  "vascular_dementia",
+  "unspecified_dementia",
+  "other_dementia_2"
+)
+ref_outcome <- "alzheimers"
+
+# --- UTILS ---
+wtd_quantile <- function(x, w, probs) {
+  ok <- is.finite(x) & is.finite(w) & w > 0
+  x <- x[ok]
+  w <- w[ok]
+  if (!length(x) || sum(w) <= 0) return(rep(NA_real_, length(probs)))
+  o <- order(x)
+  x <- x[o]
+  w <- w[o]
+  cw <- cumsum(w) / sum(w)
+  sapply(probs, function(p) x[which.max(cw >= p)])
+}
+
+# -------------------------------
+# Prepare minimal base once
+# -------------------------------
+prepare_base_subtypes <- function(dat, id_var, cutoff = 0) {
+  stopifnot(id_var %in% names(dat))
+  stopifnot(all(c("running_var_days", "hz_vacc") %in% names(dat)))
+
+  tibble::tibble(
+    id   = dat[[id_var]],
+    x    = as.numeric(dat$running_var_days),
+    side = ifelse(as.numeric(dat$running_var_days) < cutoff, "L", "R"),
+    hz   = as.numeric(dat$hz_vacc)
+  )
+}
+
+# -------------------------------
+# Common m-out-of-n resample by side
+# -------------------------------
+resample_idx_by_side <- function(base, rho = 0.95) {
+  iL <- which(base$side == "L")
+  iR <- which(base$side == "R")
+
+  if (!length(iL) || !length(iR)) {
+    return(integer(0))
+  }
+
+  mL <- max(1L, floor(rho * length(iL)))
+  mR <- max(1L, floor(rho * length(iR)))
+
+  c(
+    sample(iL, mL, replace = TRUE),
+    sample(iR, mR, replace = TRUE)
+  )
+}
+
+# -------------------------------
+# Subtype-specific thinning inside common resample
+# -------------------------------
+thin_idx_on_base <- function(idx, base, y_vec, E_star = 160) {
+  if (!length(idx)) return(integer(0))
+
+  d <- tibble::tibble(
+    idx  = idx,
+    side = base$side[idx],
+    y    = y_vec[idx]
+  )
+
+  prev <- d %>%
+    dplyr::group_by(side) %>%
+    dplyr::summarise(
+      Ns  = dplyr::n(),
+      pks = mean(y, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      pks = ifelse(is.nan(pks) | !is.finite(pks), 0, pks),
+      q   = ifelse(pks <= 0, 1, pmin(1, E_star / pmax(1, Ns * pks)))
+    )
+
+  d <- d %>% dplyr::left_join(prev, by = "side")
+
+  if (any(!is.finite(d$q))) {
+    d$q[!is.finite(d$q)] <- 1
+  }
+
+  keep <- stats::rbinom(nrow(d), 1, d$q) == 1
+  out <- d$idx[keep]
+
+  # fallback: if thinning wipes a side, revert to unthinned resample
+  out_sides <- unique(base$side[out])
+  if (!all(c("L", "R") %in% out_sides)) {
+    return(idx)
+  }
+
+  out
+}
+
+# -------------------------------
+# Local counts inside |x| <= h_star
+# -------------------------------
+local_counts_ok_idx <- function(ii, base, h_star, n_min_per_side) {
+  if (!length(ii)) return(FALSE)
+
+  win <- ii[abs(base$x[ii]) <= h_star]
+  if (!length(win)) return(FALSE)
+
+  tab <- table(base$side[win])
+  all(c("L", "R") %in% names(tab)) &&
+    min(as.integer(tab[c("L", "R")])) >= n_min_per_side
+}
+
+# -------------------------------
+# RD wrappers
+# -------------------------------
+fit_rd_outcome_idx <- function(ii, base, y_vec, h_star) {
+  if (!length(ii)) {
+    return(list(tau = NA_real_, se = NA_real_, tau_rel = NA_real_))
+  }
+
+  d <- tibble::tibble(
+    y  = as.numeric(y_vec[ii]),
+    x  = as.numeric(base$x[ii]),
+    hz = as.numeric(base$hz[ii])
+  )
+
+  fit <- tryCatch({
+    rdrobust(
+      y = d$y,
+      x = d$x,
+      fuzzy = d$hz,
+      c = 0,
+      p = 1,
+      kernel = "triangular",
+      masspoints = "adjust",
+      h = h_star
+    )
+  }, error = function(e) NULL)
+
+  if (is.null(fit)) {
+    return(list(tau = NA_real_, se = NA_real_, tau_rel = NA_real_))
+  }
+
+  tau <- suppressWarnings(as.numeric(fit$coef[1]))
+  se  <- suppressWarnings(as.numeric(fit$se[3]))
+  denom <- suppressWarnings(as.numeric(fit$beta_Y_p_l[1]))
+
+  tau_rel <- if (is.finite(denom) && denom != 0 && is.finite(tau)) tau / denom else NA_real_
+
+  list(
+    tau = tau,
+    se = se,
+    tau_rel = tau_rel
+  )
+}
+
+fit_first_stage_idx <- function(ii, base, h_star) {
+  if (!length(ii)) {
+    return(list(tau_fs = NA_real_, se_fs = NA_real_))
+  }
+
+  d <- tibble::tibble(
+    hz = as.numeric(base$hz[ii]),
+    x  = as.numeric(base$x[ii])
+  )
+
+  fs <- tryCatch({
+    rdrobust(
+      y = d$hz,
+      x = d$x,
+      c = 0,
+      p = 1,
+      kernel = "triangular",
+      masspoints = "adjust",
+      h = h_star
+    )
+  }, error = function(e) NULL)
+
+  if (is.null(fs)) {
+    return(list(tau_fs = NA_real_, se_fs = NA_real_))
+  }
+
+  list(
+    tau_fs = suppressWarnings(as.numeric(fs$coef[1])),
+    se_fs  = suppressWarnings(as.numeric(fs$se[3]))
+  )
+}
+
+# -------------------------------
+# One iteration with redraw QC
+# -------------------------------
+boot_once_all <- function(
+    base,
+    y_list,
+    outcomes,
+    ref_outcome,
+    E_star,
+    rho,
+    h_star,
+    n_min_per_side,
+    tau_fs_min,
+    max_redraw = 30L,
+    verbose = FALSE
+) {
+  redraws <- 0L
+  qc_flag <- NA_character_
+  idx_base <- integer(0)
+  idx_by_outcome <- NULL
+
+  repeat {
+    redraws <- redraws + 1L
+
+    if (redraws > max_redraw) {
+      qc_flag <- "max_redraw"
+      idx_base <- resample_idx_by_side(base, rho = rho)
+
+      idx_by_outcome <- lapply(outcomes, function(outc) {
+        thin_idx_on_base(idx_base, base, y_list[[outc]], E_star = E_star)
+      })
+      names(idx_by_outcome) <- outcomes
+      break
+    }
+
+    idx_base <- resample_idx_by_side(base, rho = rho)
+    if (!length(idx_base)) {
+      qc_flag <- "empty_base_resample"
+      next
+    }
+
+    qc_fail <- FALSE
+    idx_by_outcome <- vector("list", length(outcomes))
+    names(idx_by_outcome) <- outcomes
+
+    for (outc in outcomes) {
+      ii <- thin_idx_on_base(idx_base, base, y_list[[outc]], E_star = E_star)
+      idx_by_outcome[[outc]] <- ii
+
+      if (!local_counts_ok_idx(ii, base, h_star, n_min_per_side)) {
+        qc_flag <- paste0("local_n_fail_", outc)
+        qc_fail <- TRUE
+        break
+      }
+
+      fs <- fit_first_stage_idx(ii, base, h_star)
+      if (!is.finite(fs$tau_fs) || abs(fs$tau_fs) < tau_fs_min) {
+        qc_flag <- paste0("weak_first_stage_", outc)
+        qc_fail <- TRUE
+        break
+      }
+    }
+
+    if (!qc_fail) {
+      qc_flag <- NA_character_
+      break
+    }
+
+    if (verbose && redraws %% 25L == 0L) {
+      message("Redraw ", redraws, ": ", qc_flag)
+    }
+  }
+
+  fits <- lapply(outcomes, function(outc) {
+    ii <- idx_by_outcome[[outc]]
+
+    fr <- fit_rd_outcome_idx(ii, base, y_list[[outc]], h_star)
+    fs <- fit_first_stage_idx(ii, base, h_star)
+
+    nL <- sum(base$side[ii] == "L" & abs(base$x[ii]) <= h_star, na.rm = TRUE)
+    nR <- sum(base$side[ii] == "R" & abs(base$x[ii]) <= h_star, na.rm = TRUE)
+
+    tibble::tibble(
+      outcome = outc,
+      tau = fr$tau,
+      se = fr$se,
+      tau_rel = fr$tau_rel,
+      tau_fs = fs$tau_fs,
+      se_fs = fs$se_fs,
+      nL_win = nL,
+      nR_win = nR,
+      redraws = redraws,
+      qc_flag = qc_flag
+    )
+  }) %>% dplyr::bind_rows()
+
+  tau_ref <- fits$tau[fits$outcome == ref_outcome]
+  se_ref  <- fits$se[fits$outcome == ref_outcome]
+  tau_rel_ref <- fits$tau_rel[fits$outcome == ref_outcome]
+
+  if (length(tau_ref) != 1) tau_ref <- NA_real_
+  if (length(se_ref) != 1) se_ref <- NA_real_
+  if (length(tau_rel_ref) != 1) tau_rel_ref <- NA_real_
+
+  fits %>%
+    dplyr::mutate(
+      delta_vs_ref = tau - tau_ref,
+      se_ref = se_ref,
+      delta_rel_vs_ref = tau_rel - tau_rel_ref
+    )
+}
+
+# -------------------------------
+# Main runner
+# -------------------------------
+run_boot_subtypes <- function(
+    dat,
+    id_var,
+    outcomes,
+    ref_outcome,
+    B = 3000,
+    E_star = 160,
+    rho = 0.92,
+    cutoff = 0,
+    h_star,
+    n_min_per_side = 800,
+    tau_fs_min = 0.08,
+    max_redraw = 500L,
+    seed = 123,
+    progress_every = 50L,
+    save_every = 0L,
+    save_path = NULL
+) {
+  set.seed(seed)
+
+  stopifnot(id_var %in% names(dat))
+  stopifnot(all(outcomes %in% names(dat)))
+  stopifnot(ref_outcome %in% outcomes)
+
+  base <- prepare_base_subtypes(dat, id_var = id_var, cutoff = cutoff)
+
+  y_list <- lapply(outcomes, function(v) as.numeric(dat[[v]]))
+  names(y_list) <- outcomes
+
+  out <- vector("list", B)
+
+  for (b in seq_len(B)) {
+    out[[b]] <- boot_once_all(
+      base = base,
+      y_list = y_list,
+      outcomes = outcomes,
+      ref_outcome = ref_outcome,
+      E_star = E_star,
+      rho = rho,
+      h_star = h_star,
+      n_min_per_side = n_min_per_side,
+      tau_fs_min = tau_fs_min,
+      max_redraw = max_redraw,
+      verbose = FALSE
+    ) %>%
+      dplyr::mutate(iteration = b)
+
+    if (progress_every > 0L && b %% progress_every == 0L) {
+      message(sprintf("%s — iteration %d/%d", Sys.time(), b, B))
+    }
+
+    if (!is.null(save_path) && save_every > 0L && b %% save_every == 0L) {
+      tmp <- dplyr::bind_rows(out[seq_len(b)])
+      saveRDS(tmp, save_path)
+      gc()
+    }
+  }
+
+  dplyr::bind_rows(out)
+}
+
+# -------------------------------
+# RUN
+# -------------------------------
+results_df <- run_boot_subtypes(
+  dat = data_main_p,
+  id_var = "new_enc_nhi",
+  outcomes = dementia_outcomes,
+  ref_outcome = ref_outcome,
+  B = n_iter,
+  E_star = E_star,
+  rho = rho,
+  cutoff = cutoff,
+  h_star = h_star,
+  n_min_per_side = n_min_per_side,
+  tau_fs_min = tau_fs_min,
+  max_redraw = max_redraw,
+  seed = 123,
+  progress_every = 10L,
+  save_every = save_every,
+  save_path = file.path(out_dir, "data_hte_type_of_dementia_partial.RDS")
+)
+
+# --- SAVE RAW ---
+saveRDS(results_df, file.path(out_dir, "data_hte_type_of_dementia.RDS"))
+
+# -------------------------------
+# PRIMARY HETEROGENEITY
+# -------------------------------
+paired_df <- results_df %>%
+  dplyr::filter(
+    outcome != ref_outcome,
+    is.finite(delta_vs_ref)
+  )
+
+hetero_summary <- paired_df %>%
+  dplyr::group_by(outcome) %>%
+  dplyr::summarise(
+    est_delta  = median(delta_vs_ref, na.rm = TRUE),
+    lo_delta   = quantile(delta_vs_ref, 0.025, na.rm = TRUE),
+    hi_delta   = quantile(delta_vs_ref, 0.975, na.rm = TRUE),
+    p_twosided = 2 * pmin(
+      mean(delta_vs_ref >= 0, na.rm = TRUE),
+      mean(delta_vs_ref <= 0, na.rm = TRUE)
+    ),
+    .groups = "drop"
+  )
+print(hetero_summary)
+
+# -------------------------------
+# SECONDARY SENSITIVITY
+# -------------------------------
+sens_df <- results_df %>%
+  dplyr::filter(
+    outcome != ref_outcome,
+    is.finite(delta_vs_ref),
+    is.finite(se),
+    is.finite(se_ref)
+  )
+
+sens_summary <- sens_df %>%
+  dplyr::mutate(w = 1 / pmax(1e-12, se^2 + se_ref^2)) %>%
+  dplyr::group_by(outcome) %>%
+  dplyr::summarise(
+    est_w = sum(w * delta_vs_ref) / sum(w),
+    lo_w  = wtd_quantile(delta_vs_ref, w, 0.025),
+    hi_w  = wtd_quantile(delta_vs_ref, w, 0.975),
+    p_w   = {
+      wpos <- sum(w[delta_vs_ref >= 0], na.rm = TRUE)
+      wneg <- sum(w[delta_vs_ref <= 0], na.rm = TRUE)
+      2 * min(wpos, wneg) / (wpos + wneg)
+    },
+    .groups = "drop"
+  )
+print(sens_summary)
+
+# -------------------------------
+# OPTIONAL: relative-scale contrasts
+# -------------------------------
+paired_rel <- results_df %>%
+  dplyr::filter(
+    outcome != ref_outcome,
+    is.finite(delta_rel_vs_ref)
+  )
+
+hetero_re_summary <- paired_rel %>%
+  dplyr::group_by(outcome) %>%
+  dplyr::summarise(
+    est_delta_rel = median(delta_rel_vs_ref, na.rm = TRUE),
+    lo_delta_rel  = quantile(delta_rel_vs_ref, 0.025, na.rm = TRUE),
+    hi_delta_rel  = quantile(delta_rel_vs_ref, 0.975, na.rm = TRUE),
+    p_twosided    = 2 * pmin(
+      mean(delta_rel_vs_ref >= 0, na.rm = TRUE),
+      mean(delta_rel_vs_ref <= 0, na.rm = TRUE)
+    ),
+    .groups = "drop"
+  )
+print(hetero_re_summary)
+
+saveRDS(hetero_summary,    file.path(out_dir, "hetero_summary.RDS"))
+saveRDS(sens_summary,      file.path(out_dir, "sens_summary.RDS"))
+saveRDS(hetero_re_summary, file.path(out_dir, "hetero_re_summary.RDS"))
+```
+
+
+```{r}
+# Bootstrap plots
+
+# Gender
+# Medians (for vlines + boxed labels)
+med_df <- boot_gender %>%
+  mutate(tau = tau*100,
+         tau_rel = tau_rel * 100) %>%
+  group_by(level) %>%
+  summarise(median_tau = median(tau, na.rm = TRUE),
+            median_tau_rel = median(tau_rel, na.rm = TRUE),
+            .groups = "drop") %>%
+  mutate(
+    level_lab = recode(level, F = "Females", M = "Males"),
+    lab = paste("Medians:\n",sprintf("%.2f", median_tau),"abs. (p.p.)","\n",
+                sprintf("%.2f", median_tau_rel),"rel. (%)")
+  )
+
+
+pval <- gender_primary$p_twosided
+
+
+p_gender <- boot_gender %>%
+  mutate(level_lab = recode(level, F = "Females", M = "Males"),
+         tau = tau*100) %>%
+  ggplot(aes(x = tau, fill = level_lab, colour = level_lab)) +
+  geom_density(alpha = 0.25, linewidth = 0.9, adjust = 1) +
+  geom_vline(
+    data = med_df,
+    aes(xintercept = median_tau, colour = level_lab),
+    linewidth = 0.9,
+    show.legend = FALSE
+  ) +
+  # boxed annotations (one per group)
+  geom_label(
+    data = med_df,
+    aes(
+      x = median_tau,
+      y = Inf,
+      label = lab,
+      colour = level_lab
+    ),
+    fill = "white",
+    label.size = 0.25,
+    label.r = unit(0, "lines"),
+    vjust = 1.4,
+    hjust = ifelse(med_df$level == "M", -0.05, 1.05),
+    size = 3.6,
+    show.legend = FALSE
+  ) +
+  scale_x_continuous(
+    limits = c(-60, 60),
+    breaks = seq(-60, 60, by = 10),
+    minor_breaks = seq(-60, 60, by = 1),
+    labels = label_number(accuracy = 1)
+  ) +
+  labs(
+    x = "Effect of HZ vaccination receipt (% points)",
+    y = "Density",
+    fill = NULL,
+    colour = NULL,
+  ) +
+  annotate(
+    "text",
+    x = Inf, y = Inf,
+    label = paste0("p = ",pval),
+    hjust = 1.05, vjust = 1.20,
+    size = 3.6,
+    colour = "black"
+  ) +
+  scale_fill_manual(
+    values = c("Females" = "#FF5100",
+               "Males" = "#0000FF")
+  ) +
+  scale_colour_manual(
+    values = c("Females" = "#FF5100",
+               "Males" = "#0000FF")
+  )+
+  scale_y_continuous(expand = expansion(mult = c(0, 1))) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "top",
+    legend.justification = "left",
+    axis.ticks.x = element_line(linewidth = 0.4),
+    axis.ticks.length.x = unit(3, "pt"),
+    axis.line.x = element_line(linewidth = 0.5),
+    axis.line.y = element_line(linewidth = 0.5),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+
+# dementia baseline risk index
+# Medians (for vlines + boxed labels)
+med_df <- boot_risk %>%
+  mutate(tau = tau*100,
+         tau_rel = tau_rel * 100) %>%
+  group_by(level) %>%
+  summarise(median_tau = median(tau, na.rm = TRUE),
+            median_tau_rel = median(tau_rel, na.rm = TRUE),
+            .groups = "drop") %>%
+  mutate(
+    level_lab = recode(level, "1" = "Above median risk", "0" = "Below median risk"),
+    lab = paste("Medians:\n",sprintf("%.2f", median_tau),"abs. (p.p.)","\n",
+                sprintf("%.2f", median_tau_rel),"rel. (%)")
+  )
+
+
+pval <- risk_primary$p_twosided
+
+
+p_risk <- boot_risk %>%
+  mutate(level_lab = recode(level, "1" = "Above median risk", "0" = "Below median risk"),
+         tau = tau*100,
+         tau_rel = tau_rel * 100) %>%
+  ggplot(aes(x = tau, fill = level_lab, colour = level_lab)) +
+  geom_density(alpha = 0.25, linewidth = 0.9, adjust = 1) +
+  geom_vline(
+    data = med_df,
+    aes(xintercept = median_tau, colour = level_lab),
+    linewidth = 0.9,
+    show.legend = FALSE
+  ) +
+  geom_label(
+    data = med_df,
+    aes(
+      x = median_tau,
+      y = Inf,
+      label = lab,
+      colour = level_lab
+    ),
+    fill = "white",
+    label.size = 0.25,
+    label.r = unit(0, "lines"),
+    vjust = 1.4,
+    hjust = ifelse(med_df$level == "1", -0.05, 1.05),
+    size = 3.6,
+    show.legend = FALSE
+  ) +
+  scale_x_continuous(
+    limits = c(-50, 50),
+    breaks = seq(-50, 50, by = 10),
+    minor_breaks = seq(-50, 50, by = 1),
+    labels = label_number(accuracy = 1)
+  ) +
+  labs(
+    x = "Effect of HZ vaccination receipt (% points)",
+    y = "Density",
+    fill = NULL,
+    colour = NULL,
+  ) +
+  annotate(
+    "text",
+    x = Inf, y = Inf,
+    label = paste0("p = ",pval),
+    hjust = 1.05, vjust = 1.20,
+    size = 3.6,
+    colour = "black"
+  ) +
+  scale_fill_manual(
+    values = c("Below median risk" = "#FF5100",
+               "Above median risk" = "#0000FF")
+  ) +
+  scale_colour_manual(
+    values = c("Below median risk" = "#FF5100",
+               "Above median risk" = "#0000FF")
+  )+
+  scale_y_continuous(expand = expansion(mult = c(0, 1))) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "top",
+    legend.justification = "left",
+    axis.ticks.x = element_line(linewidth = 0.4),
+    axis.ticks.length.x = unit(3, "pt"),
+    axis.line.x = element_line(linewidth = 0.5),
+    axis.line.y = element_line(linewidth = 0.5),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+
+# dementia baseline deprivation index
+# Medians (for vlines + boxed labels)
+med_df <- boot_dep %>%
+  mutate(tau = tau*100,
+         tau_rel = tau_rel * 100) %>%
+  group_by(level) %>%
+  summarise(median_tau = median(tau, na.rm = TRUE),
+            median_tau_rel = median(tau_rel, na.rm = TRUE),
+            .groups = "drop") %>%
+  mutate(
+    level_lab = recode(level, "1" = "Above median deprivation", "0" = "Below median deprivation"),
+    lab = paste("Medians:\n",sprintf("%.2f", median_tau),"abs. (p.p.)","\n",
+                sprintf("%.2f", median_tau_rel),"rel. (%)")
+  )
+
+
+pval <- sprintf("%.3f", dep_primary$p_twosided)
+
+
+p_dep <- boot_dep %>%
+  mutate(level_lab = recode(level, "1" = "Above median deprivation", "0" = "Below median deprivation"),
+         tau = tau*100,
+         tau_rel = tau_rel * 100) %>%
+  ggplot(aes(x = tau, fill = level_lab, colour = level_lab)) +
+  geom_density(alpha = 0.25, linewidth = 0.9, adjust = 1) +
+  geom_vline(
+    data = med_df,
+    aes(xintercept = median_tau, colour = level_lab),
+    linewidth = 0.9,
+    show.legend = FALSE
+  ) +
+  geom_label(
+    data = med_df,
+    aes(
+      x = median_tau,
+      y = Inf,
+      label = lab,
+      colour = level_lab
+    ),
+    fill = "white",
+    label.size = 0.25,
+    label.r = unit(0, "lines"),
+    vjust = 1.4,
+    hjust = ifelse(med_df$level == "1", -0.05, 1.05),
+    size = 3.6,
+    show.legend = FALSE
+  ) +
+  scale_x_continuous(
+    limits = c(-50, 50),
+    breaks = seq(-50, 50, by = 10),
+    minor_breaks = seq(-50, 50, by = 1),
+    labels = label_number(accuracy = 1)
+  ) +
+  labs(
+    x = "Effect of HZ vaccination receipt (% points)",
+    y = "Density",
+    fill = NULL,
+    colour = NULL,
+  ) +
+  annotate(
+    "text",
+    x = Inf, y = Inf,
+    label = paste0("p = ",pval),
+    hjust = 1.05, vjust = 1.20,   # nudge inward from top-right corner
+    size = 3.6,
+    colour = "black"
+  ) +
+  scale_fill_manual(
+    values = c("Below median deprivation" = "#FF5100",
+               "Above median deprivation" = "#0000FF")
+  ) +
+  scale_colour_manual(
+    values = c("Below median deprivation" = "#FF5100",
+               "Above median deprivation" = "#0000FF")
+  )+
+  scale_y_continuous(expand = expansion(mult = c(0, 1))) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "top",
+    legend.justification = "left",
+    axis.ticks.x = element_line(linewidth = 0.4),
+    axis.ticks.length.x = unit(3, "pt"),
+    axis.line.x = element_line(linewidth = 0.5),
+    axis.line.y = element_line(linewidth = 0.5),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+
+# Maori/Pasifika
+# Medians (for vlines + boxed labels)
+med_df <- boot_mp %>%
+  mutate(tau = tau*100,
+         tau_rel = tau_rel * 100) %>%
+  group_by(level) %>%
+  summarise(median_tau = median(tau, na.rm = TRUE),
+            median_tau_rel = median(tau_rel, na.rm = TRUE),
+            .groups = "drop") %>%
+  mutate(
+    level_lab = recode(level, "1" = "Maori/Pasifika", "0" = "Other ethnicities"),
+    lab = paste("Medians:\n",sprintf("%.2f", median_tau),"abs. (p.p.)","\n",
+                sprintf("%.2f", median_tau_rel),"rel. (%)")
+  )
+
+
+pval <- sprintf("%.3f", mp_primary$p_twosided)
+
+
+p_mp <- boot_mp %>%
+  mutate(level_lab = recode(level, "1" = "Maori/Pasifika", "0" = "Other ethnicities"),
+         tau = tau*100,
+         tau_rel = tau_rel * 100) %>%
+  ggplot(aes(x = tau, fill = level_lab, colour = level_lab)) +
+  geom_density(alpha = 0.25, linewidth = 0.9, adjust = 1) +
+  geom_vline(
+    data = med_df,
+    aes(xintercept = median_tau, colour = level_lab),
+    linewidth = 0.9,
+    show.legend = FALSE
+  ) +
+  geom_label(
+    data = med_df,
+    aes(
+      x = median_tau,
+      y = Inf,
+      label = lab,
+      colour = level_lab
+    ),
+    fill = "white",
+    label.size = 0.25,
+    label.r = unit(0, "lines"),
+    vjust = 1.4,
+    hjust = ifelse(med_df$level == "1", -0.05, 1.05),
+    size = 3.6,
+    show.legend = FALSE
+  ) +
+  scale_x_continuous(
+    limits = c(-50, 50),
+    breaks = seq(-50, 50, by = 10),
+    minor_breaks = seq(-50, 50, by = 1),
+    labels = label_number(accuracy = 1)
+  ) +
+  labs(
+    x = "Effect of HZ vaccination receipt (% points)",
+    y = "Density",
+    fill = NULL,
+    colour = NULL,
+  ) +
+  annotate(
+    "text",
+    x = Inf, y = Inf,
+    label = paste0("p = ",pval),
+    hjust = 1.05, vjust = 1.20,
+    size = 3.6,
+    colour = "black"
+  ) +
+  scale_fill_manual(
+    values = c("Other ethnicities" = "#FF5100",
+               "Maori/Pasifika" = "#0000FF")
+  ) +
+  scale_colour_manual(
+    values = c("Other ethnicities" = "#FF5100",
+               "Maori/Pasifika" = "#0000FF")
+  )+
+  scale_y_continuous(expand = expansion(mult = c(0, 1))) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "top",
+    legend.justification = "left",
+    axis.ticks.x = element_line(linewidth = 0.4),
+    axis.ticks.length.x = unit(3, "pt"),
+    axis.line.x = element_line(linewidth = 0.5),
+    axis.line.y = element_line(linewidth = 0.5),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+
+# Herpes zoster at baseline
+
+
+# Medians (for vlines + boxed labels)
+med_df <- boot_zoster %>%
+  mutate(tau = tau*100,
+         tau_rel = tau_rel * 100) %>%
+  group_by(level) %>%
+  summarise(median_tau = median(tau, na.rm = TRUE),
+            median_tau_rel = median(tau_rel, na.rm = TRUE),
+            .groups = "drop") %>%
+  mutate(
+    level_lab = recode(level, "1" = "History of HZ", "0" = "No history of HZ"),
+    lab = paste("Medians:\n",sprintf("%.2f", median_tau),"abs. (p.p.)","\n",
+                sprintf("%.2f", median_tau_rel),"rel. (%)")
+  )
+
+
+pval <- sprintf("%.3f", zoster_primary$p_twosided)
+
+
+p_zoster <- boot_zoster %>%
+  mutate(level_lab = recode(level, "1" = "History of HZ", "0" = "No history of HZ"),
+         tau = tau*100,
+         tau_rel = tau_rel * 100) %>%
+  ggplot(aes(x = tau, fill = level_lab, colour = level_lab)) +
+  geom_density(alpha = 0.25, linewidth = 0.9, adjust = 1) +
+  geom_vline(
+    data = med_df,
+    aes(xintercept = median_tau, colour = level_lab),
+    linewidth = 0.9,
+    show.legend = FALSE
+  ) +
+  geom_label(
+    data = med_df,
+    aes(
+      x = median_tau,
+      y = Inf,
+      label = lab,
+      colour = level_lab
+    ),
+    fill = "white",
+    label.size = 0.25,
+    label.r = unit(0, "lines"),
+    vjust = 1.4,
+    hjust = ifelse(med_df$level == "0", -0.05, 1.05),
+    size = 3.6,
+    show.legend = FALSE
+  ) +
+  scale_x_continuous(
+    limits = c(-50, 50),
+    breaks = seq(-50, 50, by = 10),
+    minor_breaks = seq(-50, 50, by = 1),
+    labels = label_number(accuracy = 1)
+  ) +
+  labs(
+    x = "Effect of HZ vaccination receipt (% points)",
+    y = "Density",
+    fill = NULL,
+    colour = NULL,
+  ) +
+  annotate(
+    "text",
+    x = Inf, y = Inf,
+    label = paste0("p = ",pval),
+    hjust = 1.05, vjust = 1.20,
+    size = 3.6,
+    colour = "black"
+  ) +
+  scale_fill_manual(
+    values = c("No history of HZ" = "#FF5100",
+               "History of HZ" = "#0000FF")
+  ) +
+  scale_colour_manual(
+    values = c("No history of HZ" = "#FF5100",
+               "History of HZ" = "#0000FF")
+  )+
+  scale_y_continuous(expand = expansion(mult = c(0, 1))) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "top",
+    legend.justification = "left",
+    axis.ticks.x = element_line(linewidth = 0.4),
+    axis.ticks.length.x = unit(3, "pt"),
+    axis.line.x = element_line(linewidth = 0.5),
+    axis.line.y = element_line(linewidth = 0.5),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+
+# Stroke at baseline
+# Medians (for vlines + boxed labels)
+med_df <- boot_stroke %>%
+  mutate(tau = tau*100,
+         tau_rel = tau_rel * 100) %>%
+  group_by(level) %>%
+  summarise(median_tau = median(tau, na.rm = TRUE),
+            median_tau_rel = median(tau_rel, na.rm = TRUE),
+            .groups = "drop") %>%
+  mutate(
+    level_lab = recode(level, "1" = "History of stroke", "0" = "No history of stroke"),
+    lab = paste("Medians:\n",sprintf("%.2f", median_tau),"abs. (p.p.)","\n",
+                sprintf("%.2f", median_tau_rel),"rel. (%)")
+  )
+
+
+pval <- sprintf("%.3f", stroke_primary$p_twosided)
+
+
+p_stroke <- boot_stroke %>%
+  mutate(level_lab = recode(level, "1" = "History of stroke", "0" = "No history of stroke"),
+         tau = tau*100,
+         tau_rel = tau_rel * 100) %>%
+  ggplot(aes(x = tau, fill = level_lab, colour = level_lab)) +
+  geom_density(alpha = 0.25, linewidth = 0.9, adjust = 1) +
+  geom_vline(
+    data = med_df,
+    aes(xintercept = median_tau, colour = level_lab),
+    linewidth = 0.9,
+    show.legend = FALSE
+  ) +
+  geom_label(
+    data = med_df,
+    aes(
+      x = median_tau,
+      y = Inf,
+      label = lab,
+      colour = level_lab
+    ),
+    fill = "white",
+    label.size = 0.25,
+    label.r = unit(0, "lines"),
+    vjust = 1.4,
+    hjust = ifelse(med_df$level == "1", -0.05, 1.05),
+    size = 3.6,
+    show.legend = FALSE
+  ) +
+  scale_x_continuous(
+    limits = c(-50, 50),
+    breaks = seq(-50, 50, by = 10),
+    minor_breaks = seq(-50, 50, by = 1),
+    labels = label_number(accuracy = 1)
+  ) +
+  labs(
+    x = "Effect of HZ vaccination receipt (% points)",
+    y = "Density",
+    fill = NULL,
+    colour = NULL,
+  ) +
+  annotate(
+    "text",
+    x = Inf, y = Inf,
+    label = paste0("p = ",pval),
+    hjust = 1.05, vjust = 1.20,
+    size = 3.6,
+    colour = "black"
+  ) +
+  scale_fill_manual(
+    values = c("No history of stroke" = "#FF5100",
+               "History of stroke" = "#0000FF")
+  ) +
+  scale_colour_manual(
+    values = c("No history of stroke" = "#FF5100",
+               "History of stroke" = "#0000FF")
+  )+
+  scale_y_continuous(expand = expansion(mult = c(0, 1))) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "top",
+    legend.justification = "left",
+    axis.ticks.x = element_line(linewidth = 0.4),
+    axis.ticks.length.x = unit(3, "pt"),
+    axis.line.x = element_line(linewidth = 0.5),
+    axis.line.y = element_line(linewidth = 0.5),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+
+# Hypertension at baseline
+# Medians (for vlines + boxed labels)
+med_df <- boot_hyper %>%
+  mutate(tau = tau*100,
+         tau_rel = tau_rel * 100) %>%
+  group_by(level) %>%
+  summarise(median_tau = median(tau, na.rm = TRUE),
+            median_tau_rel = median(tau_rel, na.rm = TRUE),
+            .groups = "drop") %>%
+  mutate(
+    level_lab = recode(level, "1" = "History of hypertension", "0" = "No history of hypertension"),
+    lab = paste("Medians:\n",sprintf("%.2f", median_tau),"abs. (p.p.)","\n",
+                sprintf("%.2f", median_tau_rel),"rel. (%)")
+  )
+
+
+pval <- sprintf("%.3f", hyper_primary$p_twosided)
+
+
+p_hyper <- boot_hyper %>%
+  mutate(level_lab = recode(level, "1" = "History of hypertension", "0" = "No history of hypertension"),
+         tau = tau*100,
+         tau_rel = tau_rel * 100) %>%
+  ggplot(aes(x = tau, fill = level_lab, colour = level_lab)) +
+  geom_density(alpha = 0.25, linewidth = 0.9, adjust = 1) +
+  geom_vline(
+    data = med_df,
+    aes(xintercept = median_tau, colour = level_lab),
+    linewidth = 0.9,
+    show.legend = FALSE
+  ) +
+  geom_label(
+    data = med_df,
+    aes(
+      x = median_tau,
+      y = Inf,
+      label = lab,
+      colour = level_lab
+    ),
+    fill = "white",
+    label.size = 0.25,
+    label.r = unit(0, "lines"),
+    vjust = 1.4,
+    hjust = ifelse(med_df$level == "1", -0.05, 1.05),
+    size = 3.6,
+    show.legend = FALSE
+  ) +
+  scale_x_continuous(
+    limits = c(-50, 50),
+    breaks = seq(-50, 50, by = 10),
+    minor_breaks = seq(-50, 50, by = 1),
+    labels = label_number(accuracy = 1)
+  ) +
+  labs(
+    x = "Effect of HZ vaccination receipt (% points)",
+    y = "Density",
+    fill = NULL,
+    colour = NULL,
+  ) +
+  annotate(
+    "text",
+    x = Inf, y = Inf,
+    label = paste0("p = ",pval),
+    hjust = 1.05, vjust = 1.20,
+    size = 3.6,
+    colour = "black"
+  ) +
+  scale_fill_manual(
+    values = c("No history of hypertension" = "#FF5100",
+               "History of hypertension" = "#0000FF")
+  ) +
+  scale_colour_manual(
+    values = c("No history of hypertension" = "#FF5100",
+               "History of hypertension" = "#0000FF")
+  )+
+  scale_y_continuous(expand = expansion(mult = c(0, 1))) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "top",
+    legend.justification = "left",
+    axis.ticks.x = element_line(linewidth = 0.4),
+    axis.ticks.length.x = unit(3, "pt"),
+    axis.line.x = element_line(linewidth = 0.5),
+    axis.line.y = element_line(linewidth = 0.5),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+
+# Diabetes at baseline
+# Medians (for vlines + boxed labels)
+med_df <- boot_dm %>%
+  mutate(tau = tau*100,
+         tau_rel = tau_rel * 100) %>%
+  group_by(level) %>%
+  summarise(median_tau = median(tau, na.rm = TRUE),
+            median_tau_rel = median(tau_rel, na.rm = TRUE),
+            .groups = "drop") %>%
+  mutate(
+    level_lab = recode(level, "1" = "History of diabetes", "0" = "No history of diabetes"),
+    lab = paste("Medians:\n",sprintf("%.2f", median_tau),"abs. (p.p.)","\n",
+                sprintf("%.2f", median_tau_rel),"rel. (%)")
+  )
+
+
+pval <- sprintf("%.3f", dm_primary$p_twosided)
+
+
+p_dm <- boot_dm %>%
+  mutate(level_lab = recode(level, "1" = "History of diabetes", "0" = "No history of diabetes"),
+         tau = tau*100,
+         tau_rel = tau_rel * 100) %>%
+  ggplot(aes(x = tau, fill = level_lab, colour = level_lab)) +
+  geom_density(alpha = 0.25, linewidth = 0.9, adjust = 1) +
+  geom_vline(
+    data = med_df,
+    aes(xintercept = median_tau, colour = level_lab),
+    linewidth = 0.9,
+    show.legend = FALSE
+  ) +
+  geom_label(
+    data = med_df,
+    aes(
+      x = median_tau,
+      y = Inf,
+      label = lab,
+      colour = level_lab
+    ),
+    fill = "white",
+    label.size = 0.25,
+    label.r = unit(0, "lines"),
+    vjust = 1.4,
+    hjust = ifelse(med_df$level == "1", -0.05, 1.05),
+    size = 3.6,
+    show.legend = FALSE
+  ) +
+  scale_x_continuous(
+    limits = c(-50, 50),
+    breaks = seq(-50, 50, by = 10),
+    minor_breaks = seq(-50, 50, by = 1),
+    labels = label_number(accuracy = 1)
+  ) +
+  labs(
+    x = "Effect of HZ vaccination receipt (% points)",
+    y = "Density",
+    fill = NULL,
+    colour = NULL,
+  ) +
+  annotate(
+    "text",
+    x = Inf, y = Inf,
+    label = paste0("p = ",pval),
+    hjust = 1.05, vjust = 1.20,
+    size = 3.6,
+    colour = "black"
+  ) +
+  scale_fill_manual(
+    values = c("No history of diabetes" = "#FF5100",
+               "History of diabetes" = "#0000FF")
+  ) +
+  scale_colour_manual(
+    values = c("No history of diabetes" = "#FF5100",
+               "History of diabetes" = "#0000FF")
+  )+
+  scale_y_continuous(expand = expansion(mult = c(0, 1))) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "top",
+    legend.justification = "left",
+    axis.ticks.x = element_line(linewidth = 0.4),
+    axis.ticks.length.x = unit(3, "pt"),
+    axis.line.x = element_line(linewidth = 0.5),
+    axis.line.y = element_line(linewidth = 0.5),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+
+# Dementia types
+boot_type <- data_hte_type_of_dementia %>%
+  mutate(
+    outcome_lab = recode(
+      outcome,
+      alzheimers = "Alzheimer's dementia",
+      vascular_dementia = "Vascular dementia",
+      unspecified_dementia = "Unspecified dementia",
+      other_dementia_2 = "Pick's and Parkinson's dementia"
+    ),
+    tau_pp   = tau * 100,
+    tau_relp = tau_rel * 100
+  )
+
+
+ref_outcome <- "alzheimers"
+
+
+get_boot_p <- function(x) {
+  x <- x[is.finite(x)]
+  if (length(x) == 0) return(NA_real_)
+  2 * min(mean(x <= 0), mean(x >= 0))
+}
+
+
+make_density_panel <- function(data, comp_outcome,
+                               x_limits = c(-8, 8),
+                               x_breaks = seq(-8, 8, by = 2)) {
+
+  plot_df <- data %>%
+    filter(outcome %in% c(ref_outcome, comp_outcome)) %>%
+    mutate(
+      group = factor(
+        outcome_lab,
+        levels = c("Alzheimer's dementia",
+                   setdiff(unique(outcome_lab), "Alzheimer's dementia"))
+      )
+    )
+
+  comp_lab <- plot_df %>%
+    filter(outcome == comp_outcome) %>%
+    distinct(outcome_lab) %>%
+    pull(outcome_lab)
+
+
+  med_df <- plot_df %>%
+    group_by(group) %>%
+    summarise(
+      median_tau     = median(tau_pp, na.rm = TRUE),
+      median_tau_rel = median(tau_relp, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      lab = paste0(
+        "Medians:\n",
+        sprintf("%.2f", median_tau), " abs. (p.p.)\n",
+        sprintf("%.2f", median_tau_rel), " rel. (%)"
+      )
+    )
+
+
+  pval <- data %>%
+    filter(outcome == comp_outcome) %>%
+    summarise(p = get_boot_p(delta_vs_ref)) %>%
+    pull(p)
+
+  ad_median <- med_df %>%
+    filter(group == "Alzheimer's dementia") %>%
+    pull(median_tau)
+
+  comp_median <- med_df %>%
+    filter(group != "Alzheimer's dementia") %>%
+    pull(median_tau)
+
+  if (ad_median > comp_median) {
+    med_df <- med_df %>%
+      mutate(hjust_val = ifelse(group == "Alzheimer's dementia", -0.05, 1.05))
+  } else {
+    med_df <- med_df %>%
+      mutate(hjust_val = ifelse(group == "Alzheimer's dementia", 1.05, -0.05))
+  }
+
+  cols <- c("#D81B60", "#1E88E5")
+  names(cols) <- c("Alzheimer's dementia", comp_lab)
+
+  ggplot(plot_df, aes(x = tau_pp, fill = group, colour = group)) +
+    geom_density(alpha = 0.25, linewidth = 0.9, adjust = 1) +
+    geom_vline(
+      data = med_df,
+      aes(xintercept = median_tau, colour = group),
+      linewidth = 0.9,
+      show.legend = FALSE
+    ) +
+    geom_label(
+      data = med_df,
+      aes(
+        x = median_tau,
+        y = Inf,
+        label = lab,
+        colour = group
+      ),
+      fill = "white",
+      label.size = 0.25,
+      label.r = unit(0, "lines"),
+      vjust = 1.4,
+      hjust = med_df$hjust_val,
+      size = 3.4,
+      show.legend = FALSE
+    ) +
+    annotate(
+      "text",
+      x = Inf, y = Inf,
+      label = paste0("p = ", sprintf("%.3f", pval)),
+      hjust = 1.05, vjust = 1.15,
+      size = 3.5,
+      colour = "black"
+    ) +
+    scale_x_continuous(
+      limits = x_limits,
+      breaks = x_breaks,
+      labels = label_number(accuracy = 0.1)
+    ) +
+    labs(
+      title = paste("Alzheimer's dementia vs", comp_lab),
+      x = "Effect of HZ vaccination receipt (% points)",
+      y = "Density",
+      fill = NULL,
+      colour = NULL
+    ) +
+    scale_fill_manual(values = cols) +
+    scale_colour_manual(values = cols) +
+    scale_y_continuous(expand = expansion(mult = c(0, 1))) +
+    theme_minimal(base_size = 12) +
+    theme(
+      legend.position = "top",
+      legend.justification = "left",
+      axis.ticks.x = element_line(linewidth = 0.4),
+      axis.ticks.length.x = unit(3, "pt"),
+      axis.line.x = element_line(linewidth = 0.5),
+      axis.line.y = element_line(linewidth = 0.5),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      plot.title = element_text(size = 11)
+    )
+}
+
+
+p_vasc <- make_density_panel(boot_type, "vascular_dementia")
+p_uns  <- make_density_panel(boot_type, "unspecified_dementia")
+p_oth  <- make_density_panel(boot_type, "other_dementia_2")
+
+
+grid.arrange(
+  p_vasc, p_uns, p_oth,
+  ncol = 2
+)
+
+
+g.dt <- grid.arrange(
+  p_vasc, p_uns, p_oth,
+  ncol = 2
+)
+
+
+ggsave(
+  filename = "bootstrap_rel_type_of_dementia_long_annot.pdf",
+  plot = g.dt,
+  path = table_dir,
+  width = 10,
+  height = 10,
+  units = "in",
+  dpi = 300
+)
+
+
+grid.arrange(
+  p_dep, p_dm, p_gender, p_hyper, p_mp, p_risk, p_stroke, p_zoster,
+  ncol = 2
+)
+
+
+g.f <- grid.arrange(
+  p_dep, p_dm, p_gender, p_hyper, p_mp, p_risk, p_stroke, p_zoster,
+  ncol = 2
+)
+
+
+ggsave(
+  filename = "hte_multipanel.pdf",
+  plot = g.f,
+  path = table_dir,
+  width = 10,
+  height = 3*5,
+  units = "in",
+  dpi = 300
+)
+```

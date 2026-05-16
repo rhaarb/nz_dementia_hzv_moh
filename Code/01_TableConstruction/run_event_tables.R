@@ -1,0 +1,6 @@
+source("Code/01_TableConstruction/01_cohort_vaccines.R")
+source("Code/01_TableConstruction/02_public_hospital.R")
+source("Code/01_TableConstruction/03_private_hospital.R")
+source("Code/01_TableConstruction/04_pharmaceutical.R")
+source("Code/01_TableConstruction/05_mortality.R")
+source("Code/01_TableConstruction/06_health_system_activity.R")

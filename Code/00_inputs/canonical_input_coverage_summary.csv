@@ -1,0 +1,63 @@
+input_type,event,n_rows,covered
+icd,age_related_hearing_loss,6,TRUE
+icd,alcohol,10,TRUE
+icd,alzheimers,7,TRUE
+icd,anxiety,10,TRUE
+icd,aortic_aneurysm,12,TRUE
+icd,ATF,3,TRUE
+icd,bacterial_infection,733,TRUE
+icd,Breast cancer,21,TRUE
+icd,CANCER_COLORECTAL,39,TRUE
+icd,CANCER_LUNG,22,TRUE
+icd,CANCER_PROSTATE,7,TRUE
+icd,ckd,4,TRUE
+icd,COPD,41,TRUE
+icd,dementia_narrow_def,23,TRUE
+icd,depression,14,TRUE
+icd,DM,93,TRUE
+icd,FALLS,419,TRUE
+icd,hypertension,34,TRUE
+icd,IHD,54,TRUE
+icd,immuno_compromised,141,TRUE
+icd,LBP,65,TRUE
+icd,Leukaemia,60,TRUE
+icd,LRI,180,TRUE
+icd,lymphoma,36,TRUE
+icd,NRVD,19,TRUE
+icd,oral_disorders,100,TRUE
+icd,osteoarthritis,59,TRUE
+icd,other_dementia,8,TRUE
+icd,other_dementia_2,2,TRUE
+icd,other_infections,858,TRUE
+icd,Pancreatic cancer,17,TRUE
+icd,parkinsons,7,TRUE
+icd,rheumatological_diseases,228,TRUE
+icd,Stomach cancer,2,TRUE
+icd,STROKE,74,TRUE
+icd,unspecified_dementia,1,TRUE
+icd,vascular_dementia,6,TRUE
+icd,viral_infection,287,TRUE
+icd,Zoster,7,TRUE
+drug,Agents Affecting the Renin-Angiotensin System,46,TRUE
+drug,Alpha-Adrenoceptor Blockers,13,TRUE
+drug,Analgesics,117,TRUE
+drug,Antibacterials,168,TRUE
+drug,Antidepressants,63,TRUE
+drug,Antivirals,14,TRUE
+drug,Aspirin,10,TRUE
+drug,Beta-Adrenoceptor Blockers,49,TRUE
+drug,Calcium Channel Blockers,34,TRUE
+drug,Cephalosporins and Cephamycins,27,TRUE
+drug,Diabetes,48,TRUE
+drug,Diuretics,9,TRUE
+drug,Immuno_compromised,335,TRUE
+drug,Lipid-Modifying Agents,18,TRUE
+drug,Macrolides,25,TRUE
+drug,Non-Steroidal Anti-Inflammatory Drugs,71,TRUE
+drug,Other Antibiotics,54,TRUE
+drug,Penicillins,51,TRUE
+drug,Tetracyclines,11,TRUE
+drug,Thyroid and Antithyroid Agents,10,TRUE
+drug,Treatments for Dementia,4,TRUE
+drug,Vitamins,43,TRUE
+drug,Zoster_drug,2,TRUE
