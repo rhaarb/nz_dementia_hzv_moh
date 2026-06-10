@@ -1648,7 +1648,7 @@ saveRDS(hetero_re_summary, file.path(out_dir, "hetero_re_summary.RDS"))
 ```
 
 
-```{r}
+```{r, fig.width = 10, fig.height = 15, out.width = "100%"}
 # Bootstrap plots
 if (!exists("boot_gender", inherits = FALSE)) {
   boot_gender <- readRDS(file.path(processed_df_dir, "boot_gender.RDS"))
@@ -2549,16 +2549,13 @@ p_uns  <- make_density_panel(boot_type, "unspecified_dementia")
 p_oth  <- make_density_panel(boot_type, "other_dementia_2")
 
 
-grid.arrange(
+g.dt <- arrangeGrob(
   p_vasc, p_uns, p_oth,
   ncol = 2
 )
 
 
-g.dt <- grid.arrange(
-  p_vasc, p_uns, p_oth,
-  ncol = 2
-)
+grid.draw(g.dt)
 
 
 ggsave(
@@ -2572,16 +2569,13 @@ ggsave(
 )
 
 
-grid.arrange(
+g.f <- arrangeGrob(
   p_dep, p_dm, p_gender, p_hyper, p_mp, p_risk, p_stroke, p_zoster,
   ncol = 2
 )
 
 
-g.f <- grid.arrange(
-  p_dep, p_dm, p_gender, p_hyper, p_mp, p_risk, p_stroke, p_zoster,
-  ncol = 2
-)
+grid.draw(g.f)
 
 
 ggsave(
