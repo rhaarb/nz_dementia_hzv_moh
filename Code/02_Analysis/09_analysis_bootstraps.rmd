@@ -94,11 +94,73 @@ if (!file.exists(bootstrap_input_path)) {
   stop("Bootstrap input file does not exist: ", bootstrap_input_path, call. = FALSE)
 }
 data_main_p <- readRDS(bootstrap_input_path)
+
+bootstrap_cache_files <- c(
+  boot_gender = "boot_gender.RDS",
+  gender_primary = "gender_primary.RDS",
+  gender_sensitivity = "gender_sensitivity.RDS",
+  boot_risk = "boot_risk.RDS",
+  risk_primary = "risk_primary.RDS",
+  risk_sensitivity = "risk_sensitivity.RDS",
+  boot_dep = "boot_dep.RDS",
+  dep_primary = "dep_primary.RDS",
+  dep_sensitivity = "dep_sensitivity.RDS",
+  boot_mp = "boot_mp.RDS",
+  mp_primary = "mp_primary.RDS",
+  mp_sensitivity = "mp_sensitivity.RDS",
+  boot_zoster = "boot_zoster.RDS",
+  zoster_primary = "zoster_primary.RDS",
+  zoster_sensitivity = "zoster_sensitivity.RDS",
+  boot_stroke = "boot_stroke.RDS",
+  stroke_primary = "stroke_primary.RDS",
+  stroke_sensitivity = "stroke_sensitivity.RDS",
+  boot_hyper = "boot_hyper.RDS",
+  hyper_primary = "hyper_primary.RDS",
+  hyper_sensitivity = "hyper_sensitivity.RDS",
+  boot_dm = "boot_dm.RDS",
+  dm_primary = "dm_primary.RDS",
+  dm_sensitivity = "dm_sensitivity.RDS",
+  boot_atf = "boot_atf.RDS",
+  atf_primary = "atf_primary.RDS",
+  atf_sensitivity = "atf_sensitivity.RDS",
+  data_hte_type_of_dementia = "data_hte_type_of_dementia.RDS",
+  hetero_summary = "hetero_summary.RDS",
+  sens_summary = "sens_summary.RDS",
+  hetero_re_summary = "hetero_re_summary.RDS"
+)
+
+bootstrap_cache_paths <- file.path(processed_df_dir, bootstrap_cache_files)
+rerun_bootstraps <- identical(Sys.getenv("NZ_RERUN_BOOTSTRAPS"), "TRUE")
+bootstrap_cache_complete <- all(file.exists(bootstrap_cache_paths))
+run_bootstraps <- rerun_bootstraps
+
+if (!rerun_bootstraps) {
+  missing_bootstrap_outputs <- bootstrap_cache_paths[!file.exists(bootstrap_cache_paths)]
+
+  if (length(missing_bootstrap_outputs) > 0) {
+    stop(
+      paste0(
+        "Bootstrap outputs are missing, and NZ_RERUN_BOOTSTRAPS is not TRUE. ",
+        "This prevents accidentally rerunning the week-long bootstrap. Missing files: ",
+        paste(basename(missing_bootstrap_outputs), collapse = ", ")
+      ),
+      call. = FALSE
+    )
+  }
+
+  knit_env <- knitr::knit_global()
+  for (object_name in names(bootstrap_cache_paths)) {
+    assign(object_name, readRDS(bootstrap_cache_paths[[object_name]]), envir = knit_env)
+  }
+  message("Loaded existing bootstrap outputs from: ", processed_df_dir)
+} else {
+  message("NZ_RERUN_BOOTSTRAPS=TRUE; bootstrap chunks will be recomputed.")
+}
 ```
 
 ## Bootstrap analyses
 
-```{r, warning=FALSE, message = TRUE}
+```{r, warning=FALSE, message = TRUE, eval = run_bootstraps}
 # ==========================================================
 # Heterogeneity bootstrap helper functions.
 # ==========================================================
@@ -1055,7 +1117,7 @@ saveRDS(atf_sensitivity, file.path(processed_df_dir, "atf_sensitivity.RDS"))
 
 ```
 
-```{r, warning = FALSE, message = TRUE}
+```{r, warning = FALSE, message = TRUE, eval = run_bootstraps}
 # ===============================
 # Heterogeneity bootstrap by dementia subtype
 # ===============================
@@ -1463,6 +1525,7 @@ results_df <- run_boot_subtypes(
 
 # --- SAVE RAW ---
 saveRDS(results_df, file.path(out_dir, "data_hte_type_of_dementia.RDS"))
+data_hte_type_of_dementia <- results_df
 
 # -------------------------------
 # PRIMARY HETEROGENEITY
@@ -2261,6 +2324,12 @@ p_dm <- boot_dm %>%
 
 
 # Dementia types
+if (!exists("data_hte_type_of_dementia", inherits = FALSE)) {
+  data_hte_type_of_dementia <- readRDS(
+    file.path(out_dir, "data_hte_type_of_dementia.RDS")
+  )
+}
+
 boot_type <- data_hte_type_of_dementia %>%
   mutate(
     outcome_lab = recode(
