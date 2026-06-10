@@ -1648,7 +1648,7 @@ saveRDS(hetero_re_summary, file.path(out_dir, "hetero_re_summary.RDS"))
 ```
 
 
-```{r, fig.width = 10, fig.height = 15, out.width = "100%"}
+```{r, fig.width = 10, fig.height = 10, out.width = "100%"}
 # Bootstrap plots
 if (!exists("boot_gender", inherits = FALSE)) {
   boot_gender <- readRDS(file.path(processed_df_dir, "boot_gender.RDS"))
@@ -2567,8 +2567,10 @@ ggsave(
   units = "in",
   dpi = 300
 )
+```
 
 
+```{r, fig.width = 10, fig.height = 15, out.width = "100%"}
 g.f <- arrangeGrob(
   p_dep, p_dm, p_gender, p_hyper, p_mp, p_risk, p_stroke, p_zoster,
   ncol = 2
