@@ -152,10 +152,48 @@ if (!rerun_bootstraps) {
     )
   }
 
-  render_env <- environment()
-  for (object_name in names(bootstrap_cache_paths)) {
-    assign(object_name, readRDS(bootstrap_cache_paths[[object_name]]), envir = render_env)
-  }
+  boot_gender <- readRDS(bootstrap_cache_paths[["boot_gender"]])
+  gender_primary <- readRDS(bootstrap_cache_paths[["gender_primary"]])
+  gender_sensitivity <- readRDS(bootstrap_cache_paths[["gender_sensitivity"]])
+
+  boot_risk <- readRDS(bootstrap_cache_paths[["boot_risk"]])
+  risk_primary <- readRDS(bootstrap_cache_paths[["risk_primary"]])
+  risk_sensitivity <- readRDS(bootstrap_cache_paths[["risk_sensitivity"]])
+
+  boot_dep <- readRDS(bootstrap_cache_paths[["boot_dep"]])
+  dep_primary <- readRDS(bootstrap_cache_paths[["dep_primary"]])
+  dep_sensitivity <- readRDS(bootstrap_cache_paths[["dep_sensitivity"]])
+
+  boot_mp <- readRDS(bootstrap_cache_paths[["boot_mp"]])
+  mp_primary <- readRDS(bootstrap_cache_paths[["mp_primary"]])
+  mp_sensitivity <- readRDS(bootstrap_cache_paths[["mp_sensitivity"]])
+
+  boot_zoster <- readRDS(bootstrap_cache_paths[["boot_zoster"]])
+  zoster_primary <- readRDS(bootstrap_cache_paths[["zoster_primary"]])
+  zoster_sensitivity <- readRDS(bootstrap_cache_paths[["zoster_sensitivity"]])
+
+  boot_stroke <- readRDS(bootstrap_cache_paths[["boot_stroke"]])
+  stroke_primary <- readRDS(bootstrap_cache_paths[["stroke_primary"]])
+  stroke_sensitivity <- readRDS(bootstrap_cache_paths[["stroke_sensitivity"]])
+
+  boot_hyper <- readRDS(bootstrap_cache_paths[["boot_hyper"]])
+  hyper_primary <- readRDS(bootstrap_cache_paths[["hyper_primary"]])
+  hyper_sensitivity <- readRDS(bootstrap_cache_paths[["hyper_sensitivity"]])
+
+  boot_dm <- readRDS(bootstrap_cache_paths[["boot_dm"]])
+  dm_primary <- readRDS(bootstrap_cache_paths[["dm_primary"]])
+  dm_sensitivity <- readRDS(bootstrap_cache_paths[["dm_sensitivity"]])
+
+  boot_atf <- readRDS(bootstrap_cache_paths[["boot_atf"]])
+  atf_primary <- readRDS(bootstrap_cache_paths[["atf_primary"]])
+  atf_sensitivity <- readRDS(bootstrap_cache_paths[["atf_sensitivity"]])
+
+  data_hte_type_of_dementia <- readRDS(bootstrap_cache_paths[["data_hte_type_of_dementia"]])
+  hetero_summary <- readRDS(bootstrap_cache_paths[["hetero_summary"]])
+  sens_summary <- readRDS(bootstrap_cache_paths[["sens_summary"]])
+  hetero_re_summary <- readRDS(bootstrap_cache_paths[["hetero_re_summary"]])
+
+  stopifnot(exists("boot_gender", inherits = FALSE))
   message("Loaded existing bootstrap outputs from: ", processed_df_dir)
 } else {
   message("NZ_RERUN_BOOTSTRAPS=TRUE; bootstrap chunks will be recomputed.")
@@ -1612,6 +1650,32 @@ saveRDS(hetero_re_summary, file.path(out_dir, "hetero_re_summary.RDS"))
 
 ```{r}
 # Bootstrap plots
+if (!exists("boot_gender", inherits = FALSE)) {
+  boot_gender <- readRDS(file.path(processed_df_dir, "boot_gender.RDS"))
+  gender_primary <- readRDS(file.path(processed_df_dir, "gender_primary.RDS"))
+
+  boot_risk <- readRDS(file.path(processed_df_dir, "boot_risk.RDS"))
+  risk_primary <- readRDS(file.path(processed_df_dir, "risk_primary.RDS"))
+
+  boot_dep <- readRDS(file.path(processed_df_dir, "boot_dep.RDS"))
+  dep_primary <- readRDS(file.path(processed_df_dir, "dep_primary.RDS"))
+
+  boot_mp <- readRDS(file.path(processed_df_dir, "boot_mp.RDS"))
+  mp_primary <- readRDS(file.path(processed_df_dir, "mp_primary.RDS"))
+
+  boot_zoster <- readRDS(file.path(processed_df_dir, "boot_zoster.RDS"))
+  zoster_primary <- readRDS(file.path(processed_df_dir, "zoster_primary.RDS"))
+
+  boot_stroke <- readRDS(file.path(processed_df_dir, "boot_stroke.RDS"))
+  stroke_primary <- readRDS(file.path(processed_df_dir, "stroke_primary.RDS"))
+
+  boot_hyper <- readRDS(file.path(processed_df_dir, "boot_hyper.RDS"))
+  hyper_primary <- readRDS(file.path(processed_df_dir, "hyper_primary.RDS"))
+
+  boot_dm <- readRDS(file.path(processed_df_dir, "boot_dm.RDS"))
+  dm_primary <- readRDS(file.path(processed_df_dir, "dm_primary.RDS"))
+}
+
 
 # Gender
 # Medians (for vlines + boxed labels)
