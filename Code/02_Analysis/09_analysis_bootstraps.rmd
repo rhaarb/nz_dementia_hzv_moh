@@ -83,6 +83,7 @@ project_dir <- Sys.getenv("NZ_DATA_DIR", unset = "E:/zoster/Data")
 code_dir <- Sys.getenv("NZ_CODE_DIR", unset = "E:/zoster/Code")
 processed_df_dir <- file.path(project_dir, "Processed_df")
 table_dir <- Sys.getenv("NZ_OUTPUT_DIR", unset = "E:/zoster/Manuscript/Tables")
+out_dir <- processed_df_dir
 
 setwd(project_dir)
 source(file.path(code_dir, "FUNCTIONS.R"))
@@ -129,7 +130,10 @@ bootstrap_cache_files <- c(
   hetero_re_summary = "hetero_re_summary.RDS"
 )
 
-bootstrap_cache_paths <- file.path(processed_df_dir, bootstrap_cache_files)
+bootstrap_cache_paths <- setNames(
+  file.path(processed_df_dir, bootstrap_cache_files),
+  names(bootstrap_cache_files)
+)
 rerun_bootstraps <- identical(Sys.getenv("NZ_RERUN_BOOTSTRAPS"), "TRUE")
 bootstrap_cache_complete <- all(file.exists(bootstrap_cache_paths))
 run_bootstraps <- rerun_bootstraps
@@ -148,9 +152,9 @@ if (!rerun_bootstraps) {
     )
   }
 
-  knit_env <- knitr::knit_global()
+  render_env <- environment()
   for (object_name in names(bootstrap_cache_paths)) {
-    assign(object_name, readRDS(bootstrap_cache_paths[[object_name]]), envir = knit_env)
+    assign(object_name, readRDS(bootstrap_cache_paths[[object_name]]), envir = render_env)
   }
   message("Loaded existing bootstrap outputs from: ", processed_df_dir)
 } else {
